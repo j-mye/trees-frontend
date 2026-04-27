@@ -1,0 +1,56 @@
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+
+# Node modules and build output
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+pyvenv.cfg
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Database secrets and generated files
+database/serviceAccountKey.json
+
+# Misc
+*.cache
+*.tmp
+*.temp
+*.bak
+*~
