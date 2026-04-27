@@ -1,0 +1,4 @@
+functions-framework>=3.5.0,<4
+firebase-admin>=6.5.0,<7
+google-cloud-firestore>=2.16.0,<3
+flask>=3.0.0,<4

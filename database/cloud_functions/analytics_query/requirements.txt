@@ -1,0 +1,4 @@
+functions-framework>=3.5.0,<4
+firebase-admin>=6.5.0,<7
+flask>=3.0.0,<4
+google-cloud-bigquery>=3.25.0,<4
