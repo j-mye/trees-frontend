@@ -17,7 +17,7 @@ import { getFirebaseAuth } from '../firebase.js'
 
 /**
  * @typedef {object} TreePriorityRow
- * @property {string} tree_row_id
+ * @property {string} tree_id
  * @property {number} priority_score
  * @property {number} risk_term_k1_I_f_p_f_b
  * @property {number} age_term_k3_a_p
@@ -213,11 +213,12 @@ export function treePointsToGeoJSON(treePoints) {
     type: 'FeatureCollection',
     features: treePoints.map((p, i) => ({
       type: 'Feature',
-      id: i,
+      id: p.tree_id ?? i,
       properties: {
+        tree_id: p.tree_id ?? '',
         dbh: p.dbh,
         condition: p.condition,
-        quarter_section: p.quarter_section,
+        qs_id: p.qs_id ?? p.quarter_section ?? '',
         species: p.species,
       },
       geometry: {

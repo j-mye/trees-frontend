@@ -182,7 +182,7 @@ export function buildQsLabelPoints(geojson) {
     const lat = p.center_lat
     if (lon == null || lat == null) return null
 
-    const qs = String(p.QTRSEC ?? p.quarter_section ?? '')
+    const qs = String(p.qs_id ?? p.QTRSEC ?? p.quarter_section ?? '')
     const count =
       p.tree_count != null && String(p.tree_count).trim() !== ''
         ? Number(p.tree_count) || 0

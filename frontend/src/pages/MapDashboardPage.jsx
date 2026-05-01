@@ -20,7 +20,7 @@ import {
 
 /**
  * @typedef {object} TreePriorityRow
- * @property {string} tree_row_id
+ * @property {string} tree_id
  * @property {number} priority_score
  * @property {number} risk_term_k1_I_f_p_f_b
  * @property {number} age_term_k3_a_p
@@ -119,6 +119,14 @@ function treesHeightFtFromRecord(row) {
   return Number.isFinite(n) ? n : null
 }
 
+function treeIdFromRecord(row) {
+  if (!row || typeof row !== 'object') return ''
+  const r = /** @type {Record<string, unknown>} */ (row)
+  const raw = r.tree_id ?? r.tree_row_id
+  if (raw == null) return ''
+  return String(raw).trim()
+}
+
 function getTreeFillColor(condition) {
   if (condition == null || condition === '') return '#22c55e'
   const raw = String(condition).trim()
@@ -163,7 +171,7 @@ export default function MapDashboardPage() {
   const [treeMin, setTreeMin] = useState(0)
   const [district, setDistrict] = useState('all')
   const [treePopup, setTreePopup] = useState(null)
-  /** Site / tree id (same as tree_row_id) for SHAP explanation in the QS details card. */
+  /** Site / tree id for SHAP explanation in the QS details card. */
   const [focusedTreeSiteId, setFocusedTreeSiteId] = useState(/** @type {string | null} */ (null))
   const mapRef = useRef(null)
 
@@ -389,9 +397,9 @@ export default function MapDashboardPage() {
               if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
               return {
                 type: 'Feature',
-                id: tree?.tree_row_id || i,
+                id: treeIdFromRecord(tree) || i,
                 properties: {
-                  tree_row_id: tree?.tree_row_id || '',
+                  tree_id: treeIdFromRecord(tree),
                   priority_score: Number(tree?.priority_score || 0),
                   species: tree?.species || 'N/A',
                   dbh: Number(tree?.dbh || 0),
@@ -456,13 +464,6 @@ export default function MapDashboardPage() {
         'text-halo-width': 6,
         'text-halo-blur': 0.8,
         'text-opacity': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          11, 0,
-          11.5, 1,
-        ],
-        'text-halo-opacity': [
           'interpolate',
           ['linear'],
           ['zoom'],
@@ -581,10 +582,9 @@ export default function MapDashboardPage() {
       const [lon, lat] = feature?.geometry?.coordinates || []
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return
       const props = feature?.properties || {}
-      const rowId =
-        props.tree_row_id != null && String(props.tree_row_id).trim() !== ''
-          ? String(props.tree_row_id).trim()
-          : null
+      const rowId = props.tree_id != null && String(props.tree_id).trim() !== ''
+        ? String(props.tree_id).trim()
+        : null
       if (rowId) {
         setFocusedTreeSiteId(rowId)
       }
@@ -592,7 +592,7 @@ export default function MapDashboardPage() {
         latitude: lat,
         longitude: lon,
         tree: {
-          tree_row_id: props.tree_row_id,
+          tree_id: props.tree_id,
           priority_score: Number(props.priority_score || 0),
           species: props.species,
           dbh: Number(props.dbh || 0),

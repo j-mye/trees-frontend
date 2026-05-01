@@ -5,7 +5,7 @@ import { getFirebaseAuth } from '../firebase.js'
  * Fetch SHAP English explanation for a tree/site id from getTreeShapExplanation.
  *
  * @param {object} options
- * @param {string | null | undefined} options.siteId Tree key (e.g. tree_row_id); query disabled when falsy.
+ * @param {string | null | undefined} options.siteId Tree key (e.g. tree_id); query disabled when falsy.
  * @param {string} options.shapExplanationUrl Full Cloud Function URL (VITE_CF_GET_TREE_SHAP_EXPLANATION_URL).
  * @returns {import('@tanstack/react-query').UseQueryResult<string | null, Error>}
  */

@@ -101,12 +101,11 @@ def _safe_project_id(raw: str) -> str:
 
 def _safe_qs_join_column(raw: str) -> str:
     """Allow only simple BigQuery column names to avoid SQL injection in identifiers."""
-    name = (raw or "").strip() or "QTRSEC"
-    allowed = {"QTRSEC", "OBJECTID", "quarter_section"}
-    if name in allowed:
+    name = (raw or "").strip() or "qs_id"
+    if name == "qs_id":
         return name
-    logger.warning("Invalid BQ_QS_ID_COLUMN %r; using QTRSEC", name)
-    return "QTRSEC"
+    logger.warning("Invalid BQ_QS_ID_COLUMN %r; using qs_id", name)
+    return "qs_id"
 
 
 def _safe_qs_geometry_column(raw: str) -> str:
@@ -120,11 +119,11 @@ def _safe_qs_geometry_column(raw: str) -> str:
 
 def _safe_tree_qs_id_column(raw: str) -> str:
     """Tree table column joined/filtered by quarter-section id from the map."""
-    name = (raw or "").strip() or "quarter_section"
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+    name = (raw or "").strip() or "qs_id"
+    if name == "qs_id":
         return name
-    logger.warning("Invalid BQ_TREE_QS_ID_COLUMN %r; using quarter_section", name)
-    return "quarter_section"
+    logger.warning("Invalid BQ_TREE_QS_ID_COLUMN %r; using qs_id", name)
+    return "qs_id"
 
 
 class BigQueryEnvConfig(NamedTuple):
@@ -156,12 +155,12 @@ def bigquery_config_from_environ() -> BigQueryEnvConfig:
     )
     dataset = _safe_dataset_or_table_id(_env("BQ_DATASET", "mke_tree_dataset"), "mke_tree_dataset")
     trees_table_name = _safe_dataset_or_table_id(
-        _env("BQ_TREES_TABLE_NAME") or _env("BQ_TABLE_NAME") or "tree",
-        "tree",
+        _env("BQ_TREES_TABLE_NAME") or _env("BQ_TABLE_NAME") or "trees_core",
+        "trees_core",
     )
     qs_table_name = _safe_dataset_or_table_id(
-        _env("BQ_QUARTER_SECTION_TABLE_NAME") or _env("BQ_QS_TABLE_NAME") or "quarter_section",
-        "quarter_section",
+        _env("BQ_QUARTER_SECTION_TABLE_NAME") or _env("BQ_QS_TABLE_NAME") or "quarter_sections",
+        "quarter_sections",
     )
     trees_override = _env("BQ_TREES_TABLE")
     qs_override = _env("BQ_QS_SUMMARIES_TABLE")
@@ -184,9 +183,9 @@ def bigquery_config_from_environ() -> BigQueryEnvConfig:
         bq_loc_raw,
         location,
     )
-    qs_join_column = _safe_qs_join_column(_env("BQ_QS_ID_COLUMN") or "QTRSEC")
+    qs_join_column = _safe_qs_join_column(_env("BQ_QS_ID_COLUMN") or "qs_id")
     qs_geometry_column = _safe_qs_geometry_column(_env("BQ_QS_GEOMETRY_COLUMN") or "geometry")
-    tree_qs_id_column = _safe_tree_qs_id_column(_env("BQ_TREE_QS_ID_COLUMN") or "quarter_section")
+    tree_qs_id_column = _safe_tree_qs_id_column(_env("BQ_TREE_QS_ID_COLUMN") or "qs_id")
     return BigQueryEnvConfig(
         project_id=project_id,
         dataset=dataset,
@@ -440,16 +439,14 @@ def _bq_config_cache_fingerprint(cfg: BigQueryEnvConfig) -> str:
 
 def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
     """
-    Expects quarter_section table with:
-    - id column: QTRSEC (set BQ_QS_ID_COLUMN; legacy name quarter_section)
-    - next_prune (FLOAT, often a target year)
-    - district (STRING)
-    - geometry column (BQ_QS_GEOMETRY_COLUMN, default ``geometry``): STRING GeoJSON text or GEOGRAPHY
-    - ``tree_count`` / ``total_trees``: same join aggregate (``total_trees`` kept for legacy clients).
-    - ``avg_dbh``: mean ``dbh`` from the trees table grouped by the same QS join key.
+    Expects refactored operational schema:
+    - quarter_sections (qs_id, district, geometry)
+    - qs_priority (PS_* fields, Priority_Score_Normalized)
+    - trees_core (dbh, qs_id)
     """
     qs_t = _table_ref(cfg.qs_table_fqn)
     tree_t = _table_ref(cfg.trees_table_fqn)
+    qsp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.qs_priority")
     id_col = cfg.qs_join_column
     gcol = cfg.qs_geometry_column
     tqs = cfg.tree_qs_id_column
@@ -465,11 +462,11 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
     SELECT
       CAST(qs.OBJECTID AS INT64) AS qs_objectid,
       TRIM(CAST(qs.{id_col} AS STRING)) AS qs_id,
-      CAST(qs.PS_critical AS FLOAT64) AS ps_critical,
-      CAST(qs.PS_bottom90 AS FLOAT64) AS ps_bottom90,
-      CAST(qs.PS_background AS FLOAT64) AS ps_background,
-      CAST(qs.PS_composite AS FLOAT64) AS ps_composite,
-      CAST(qs.Priority_Score_Normalized AS FLOAT64) AS priority_score_normalized,
+      CAST(qsp.PS_critical AS FLOAT64) AS ps_critical,
+      CAST(qsp.PS_bottom90 AS FLOAT64) AS ps_bottom90,
+      CAST(qsp.PS_background AS FLOAT64) AS ps_background,
+      CAST(qsp.PS_composite AS FLOAT64) AS ps_composite,
+      CAST(qsp.Priority_Score_Normalized AS FLOAT64) AS priority_score_normalized,
       CAST(COALESCE(ts.tree_count, 0) AS INT64) AS tree_count,
       CAST(COALESCE(ts.tree_count, 0) AS INT64) AS total_trees,
       CAST(COALESCE(ts.avg_dbh, 0.0) AS FLOAT64) AS avg_dbh,
@@ -478,6 +475,8 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
       ST_X(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))) AS center_lon,
       ST_Y(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))) AS center_lat
     FROM {qs_t} qs
+    LEFT JOIN {qsp_t} qsp
+      ON TRIM(CAST(qs.{id_col} AS STRING)) = TRIM(CAST(qsp.qs_id AS STRING))
     LEFT JOIN tree_stats ts
       ON TRIM(CAST(qs.{id_col} AS STRING)) = ts.clean_site_id
     WHERE qs.{gcol} IS NOT NULL
@@ -486,20 +485,21 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
 
 def _trees_sql(cfg: BigQueryEnvConfig) -> str:
     t = _table_ref(cfg.trees_table_fqn)
-    tqs = cfg.tree_qs_id_column
+    tf = _table_ref(f"{cfg.project_id}.{cfg.dataset}.trees_features")
+    sp = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
     return f"""
     SELECT
-      CAST(t.{tqs} AS STRING) AS qs_id,
-      CAST(COALESCE(CAST(t.tree_row_id AS STRING), "") AS STRING) AS tree_id,
+      CAST(t.qs_id AS STRING) AS qs_id,
+      CAST(t.tree_id AS STRING) AS tree_id,
       CAST(t.latitude AS FLOAT64) AS lat,
       CAST(t.longitude AS FLOAT64) AS lon,
       CAST(t.dbh AS FLOAT64) AS dbh,
       SAFE_CAST(t.height AS FLOAT64) AS height,
       CAST(COALESCE(CAST(t.condition_aerial AS STRING), "Unknown") AS STRING) AS condition_aerial,
-      CAST(COALESCE(CAST(t.species AS STRING), "Unknown") AS STRING) AS species,
-      CAST(t.priority_score AS FLOAT64) AS priority_score,
-      CAST(t.risk_term_k1_I_f_p_f_b AS FLOAT64) AS risk_term_k1_I_f_p_f_b,
-      CAST(t.age_term_k3_a_p AS FLOAT64) AS age_term_k3_a_p,
+      CAST(COALESCE(s.simple_species, s.full_name, s.scientific_name, "Unknown") AS STRING) AS species,
+      CAST(tf.priority_score AS FLOAT64) AS priority_score,
+      CAST(tf.risk_term_k1_I_f_p_f_b AS FLOAT64) AS risk_term_k1_I_f_p_f_b,
+      CAST(tf.age_term_k3_a_p AS FLOAT64) AS age_term_k3_a_p,
       CAST(t.age AS FLOAT64) AS age,
       CAST(t.maintenance_deficit AS INT64) AS maintenance_deficit,
       CAST(t.years_since_pruned AS INT64) AS years_since_pruned,
@@ -507,7 +507,11 @@ def _trees_sql(cfg: BigQueryEnvConfig) -> str:
       CAST(t.crown_diameter_m AS FLOAT64) AS crown_diameter_m,
       CAST(COALESCE(CAST(t.missing_or_dead AS STRING), "") AS STRING) AS missing_or_dead
     FROM {t} AS t
-    WHERE TRIM(CAST(t.{tqs} AS STRING)) = TRIM(@qs_id)
+    LEFT JOIN {tf} AS tf
+      ON CAST(t.tree_id AS STRING) = CAST(tf.tree_id AS STRING)
+    LEFT JOIN {sp} AS s
+      ON t.species_id = s.species_id
+    WHERE TRIM(CAST(t.qs_id AS STRING)) = TRIM(@qs_id)
       AND t.latitude IS NOT NULL
       AND t.longitude IS NOT NULL
     """
@@ -683,7 +687,9 @@ def _trees_payload_from_bigquery(
                 "condition_aerial": str(row["condition_aerial"] or "Unknown"),
                 "condition": str(row["condition_aerial"] or "Unknown"),
                 "species": str(row["species"] or "Unknown"),
+                "qs_id": str(row["qs_id"] or qs_id),
                 "quarter_section": str(row["qs_id"] or qs_id),
+                "tree_id": str(row["tree_id"] or ""),
                 "tree_row_id": str(row["tree_id"] or ""),
                 "priority_score": float(row["priority_score"] or 0.0),
                 "risk_term_k1_I_f_p_f_b": float(row["risk_term_k1_I_f_p_f_b"] or 0.0),
@@ -707,7 +713,7 @@ _SUMMARIES_TTL_SECONDS = 86400
 _TREES_TTL_SECONDS = 86400
 _SHAP_EXPLANATION_TTL_SECONDS = 86400
 # Bump when getTreesByQs SELECT / per-tree JSON shape changes (invalidates in-memory json_cache).
-_TREES_PAYLOAD_CACHE_REVISION = "hgt-v2"
+_TREES_PAYLOAD_CACHE_REVISION = "new-schema-v1"
 
 
 def _safe_shap_site_id_column(raw: str) -> str:
@@ -715,7 +721,7 @@ def _safe_shap_site_id_column(raw: str) -> str:
     name = (raw or "").strip() or "Site ID"
     if name == "Site ID":
         return "Site ID"
-    allowed = frozenset({"site_id", "tree_row_id", "Site_ID"})
+    allowed = frozenset({"site_id", "tree_id", "tree_row_id", "Site_ID"})
     if name in allowed and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         return name
     logger.warning("Invalid BQ_SHAP_SITE_ID_COLUMN %r; using Site ID", raw)
