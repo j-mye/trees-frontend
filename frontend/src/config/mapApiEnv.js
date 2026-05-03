@@ -17,4 +17,6 @@ export const mapApiEnv = {
   analyticsQueryUrl: String(import.meta.env.VITE_CF_ANALYTICS_QUERY_URL || '').trim(),
   /** Optional GET endpoint: field catalog metadata (Phase B). */
   analyticsSchemaUrl: String(import.meta.env.VITE_CF_ANALYTICS_SCHEMA_URL || '').trim(),
+  /** Optional User Tasks endpoint: users + service request assignment CRUD. */
+  userTasksUrl: String(import.meta.env.VITE_CF_USER_TASKS_API_URL || '').trim(),
 }

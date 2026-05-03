@@ -22,6 +22,7 @@ import os
 import re
 import time
 import traceback
+import uuid
 from typing import Any, NamedTuple
 from urllib.parse import parse_qs
 
@@ -314,7 +315,7 @@ def _cors_headers(req: https_fn.Request) -> dict[str, str]:
     allow_origin = origin if origin in allowed else "*"
     return {
         "Access-Control-Allow-Origin": allow_origin,
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With, Accept",
         "Access-Control-Max-Age": "86400",
         "Vary": "Origin",
@@ -986,5 +987,351 @@ def getTreeShapExplanation(req: https_fn.Request) -> https_fn.Response:
                 "detail": str(e),
                 "error_type": type(e).__name__,
             },
+            status=500,
+        )
+
+
+def _tasks_table_fqn(cfg: BigQueryEnvConfig, table_name: str) -> str:
+    safe = _safe_dataset_or_table_id(table_name, table_name)
+    return f"{cfg.project_id}.{cfg.dataset}.{safe}"
+
+
+def _list_users_payload(cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    users_t = _table_ref(_tasks_table_fqn(cfg, "users"))
+    sql = f"""
+    SELECT
+      CAST(user_id AS STRING) AS user_id,
+      CAST(email AS STRING) AS email,
+      CAST(role AS STRING) AS role,
+      CAST(active AS BOOL) AS active,
+      CAST(created_at AS STRING) AS created_at
+    FROM {users_t}
+    ORDER BY created_at DESC
+    """
+    rows = list(_run_query(client, sql, location=cfg.location).result())
+    users: list[dict[str, Any]] = []
+    for r in rows:
+        users.append(
+            {
+                "user_id": str(r["user_id"] or ""),
+                "email": str(r["email"] or ""),
+                "role": str(r["role"] or "viewer"),
+                "active": bool(r["active"]) if r["active"] is not None else True,
+                "created_at": str(r["created_at"] or ""),
+            }
+        )
+    return {"users": users}
+
+
+def _list_tasks_payload(cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    sr_t = _table_ref(_tasks_table_fqn(cfg, "service_requests"))
+    sra_t = _table_ref(_tasks_table_fqn(cfg, "service_request_assignees"))
+    users_t = _table_ref(_tasks_table_fqn(cfg, "users"))
+    sql = f"""
+    SELECT
+      CAST(sr.service_request_id AS STRING) AS service_request_id,
+      CAST(sr.tree_id AS STRING) AS tree_id,
+      CAST(sr.request_type AS STRING) AS request_type,
+      CAST(sr.priority AS STRING) AS priority,
+      CAST(sr.status AS STRING) AS status,
+      CAST(sr.notes AS STRING) AS notes,
+      CAST(sr.created_by AS STRING) AS created_by,
+      CAST(sr.requested_at AS STRING) AS requested_at,
+      CAST(sr.due_at AS STRING) AS due_at,
+      ARRAY_AGG(CAST(sra.user_id AS STRING) IGNORE NULLS) AS assignee_user_ids,
+      ARRAY_AGG(CAST(u.email AS STRING) IGNORE NULLS) AS assignee_emails
+    FROM {sr_t} AS sr
+    LEFT JOIN {sra_t} AS sra ON sr.service_request_id = sra.service_request_id
+    LEFT JOIN {users_t} AS u ON sra.user_id = u.user_id
+    GROUP BY 1,2,3,4,5,6,7,8,9
+    ORDER BY requested_at DESC
+    """
+    rows = list(_run_query(client, sql, location=cfg.location).result())
+    tasks: list[dict[str, Any]] = []
+    for r in rows:
+        tasks.append(
+            {
+                "service_request_id": str(r["service_request_id"] or ""),
+                "tree_id": str(r["tree_id"] or ""),
+                "request_type": str(r["request_type"] or ""),
+                "priority": str(r["priority"] or ""),
+                "status": str(r["status"] or ""),
+                "notes": str(r["notes"] or ""),
+                "created_by": str(r["created_by"] or ""),
+                "requested_at": str(r["requested_at"] or ""),
+                "due_at": str(r["due_at"] or ""),
+                "assignee_user_ids": [str(v) for v in (r["assignee_user_ids"] or []) if v],
+                "assignee_emails": [str(v) for v in (r["assignee_emails"] or []) if v],
+            }
+        )
+    return {"tasks": tasks}
+
+
+def _create_user(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    users_t = _table_ref(_tasks_table_fqn(cfg, "users"))
+    user_id_raw = req_body.get("user_id")
+    email_raw = req_body.get("email")
+    role_raw = req_body.get("role") or "viewer"
+    user_id = str(user_id_raw or "").strip()
+    email = str(email_raw or "").strip()
+    role = str(role_raw).strip().lower()
+    if not user_id:
+        raise ValueError("user_id is required")
+    if not email:
+        raise ValueError("email is required")
+    if role not in {"admin", "arborist", "viewer"}:
+        raise ValueError("role must be one of admin, arborist, viewer")
+    sql = f"""
+    MERGE {users_t} t
+    USING (
+      SELECT
+        @user_id AS user_id,
+        @email AS email,
+        @role AS role,
+        TRUE AS active,
+        CURRENT_TIMESTAMP() AS created_at
+    ) s
+    ON t.user_id = s.user_id
+    WHEN MATCHED THEN UPDATE SET
+      email = s.email,
+      role = s.role,
+      active = TRUE
+    WHEN NOT MATCHED THEN
+      INSERT (user_id, email, role, active, created_at)
+      VALUES (s.user_id, s.email, s.role, s.active, s.created_at)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+            bigquery.ScalarQueryParameter("email", "STRING", email),
+            bigquery.ScalarQueryParameter("role", "STRING", role),
+        ]
+    )
+    _run_query(client, sql, location=cfg.location, job_config=job_config).result()
+    return {"ok": True, "user_id": user_id, "email": email, "role": role, "updated_by": str(claims.get("uid") or "")}
+
+
+def _create_task(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    sr_t = _table_ref(_tasks_table_fqn(cfg, "service_requests"))
+    sra_t = _table_ref(_tasks_table_fqn(cfg, "service_request_assignees"))
+    task_id = str(req_body.get("service_request_id") or uuid.uuid4().hex[:20]).strip()
+    tree_id = str(req_body.get("tree_id") or "").strip()
+    request_type = str(req_body.get("request_type") or "inspect").strip().lower()
+    priority = str(req_body.get("priority") or "med").strip().lower()
+    status = str(req_body.get("status") or "open").strip().lower()
+    notes = str(req_body.get("notes") or "").strip()
+    due_at = req_body.get("due_at")
+    created_by = str(claims.get("uid") or "").strip()
+    assignees_raw = req_body.get("assignee_user_ids") or []
+    assignees = [str(v).strip() for v in assignees_raw if str(v).strip()]
+    if not tree_id:
+        raise ValueError("tree_id is required")
+    if request_type not in {"prune", "remove", "plant", "inspect", "treat"}:
+        raise ValueError("request_type must be one of prune, remove, plant, inspect, treat")
+    if priority not in {"low", "med", "high", "critical"}:
+        raise ValueError("priority must be one of low, med, high, critical")
+    if status not in {"open", "in_progress", "completed", "cancelled"}:
+        raise ValueError("status must be one of open, in_progress, completed, cancelled")
+    if not created_by:
+        raise ValueError("authenticated user id is required")
+    insert_sql = f"""
+    INSERT INTO {sr_t}
+      (service_request_id, tree_id, request_type, priority, status, requested_at, due_at, completed_at, notes, created_by)
+    VALUES
+      (@service_request_id, @tree_id, @request_type, @priority, @status, CURRENT_TIMESTAMP(), SAFE_CAST(@due_at AS TIMESTAMP), NULL, @notes, @created_by)
+    """
+    insert_cfg = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+            bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id),
+            bigquery.ScalarQueryParameter("request_type", "STRING", request_type),
+            bigquery.ScalarQueryParameter("priority", "STRING", priority),
+            bigquery.ScalarQueryParameter("status", "STRING", status),
+            bigquery.ScalarQueryParameter("due_at", "STRING", str(due_at or "")),
+            bigquery.ScalarQueryParameter("notes", "STRING", notes),
+            bigquery.ScalarQueryParameter("created_by", "STRING", created_by),
+        ]
+    )
+    _run_query(client, insert_sql, location=cfg.location, job_config=insert_cfg).result()
+    if assignees:
+        assignee_sql = f"""
+        INSERT INTO {sra_t} (service_request_id, user_id, assigned_at, assigned_by)
+        SELECT @service_request_id, uid, CURRENT_TIMESTAMP(), @assigned_by
+        FROM UNNEST(@assignee_user_ids) uid
+        """
+        assignee_cfg = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+                bigquery.ScalarQueryParameter("assigned_by", "STRING", created_by),
+                bigquery.ArrayQueryParameter("assignee_user_ids", "STRING", assignees),
+            ]
+        )
+        _run_query(client, assignee_sql, location=cfg.location, job_config=assignee_cfg).result()
+    return {"ok": True, "service_request_id": task_id, "created_by": created_by}
+
+
+def _assign_task_users(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    sra_t = _table_ref(_tasks_table_fqn(cfg, "service_request_assignees"))
+    task_id = str(req_body.get("service_request_id") or "").strip()
+    assignees_raw = req_body.get("assignee_user_ids") or []
+    assignees = [str(v).strip() for v in assignees_raw if str(v).strip()]
+    assigned_by = str(claims.get("uid") or "").strip()
+    if not task_id:
+        raise ValueError("service_request_id is required")
+    if not assigned_by:
+        raise ValueError("authenticated user id is required")
+    delete_sql = f"DELETE FROM {sra_t} WHERE service_request_id = @service_request_id"
+    delete_cfg = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+        ]
+    )
+    _run_query(client, delete_sql, location=cfg.location, job_config=delete_cfg).result()
+    if assignees:
+        insert_sql = f"""
+        INSERT INTO {sra_t} (service_request_id, user_id, assigned_at, assigned_by)
+        SELECT @service_request_id, uid, CURRENT_TIMESTAMP(), @assigned_by
+        FROM UNNEST(@assignee_user_ids) uid
+        """
+        insert_cfg = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+                bigquery.ScalarQueryParameter("assigned_by", "STRING", assigned_by),
+                bigquery.ArrayQueryParameter("assignee_user_ids", "STRING", assignees),
+            ]
+        )
+        _run_query(client, insert_sql, location=cfg.location, job_config=insert_cfg).result()
+    return {"ok": True, "service_request_id": task_id, "assignee_count": len(assignees)}
+
+
+def _complete_task(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    sr_t = _table_ref(_tasks_table_fqn(cfg, "service_requests"))
+    task_id = str(req_body.get("service_request_id") or "").strip()
+    if not task_id:
+        raise ValueError("service_request_id is required")
+    sql = f"""
+    UPDATE {sr_t}
+    SET
+      status = 'completed',
+      completed_at = CURRENT_TIMESTAMP()
+    WHERE service_request_id = @service_request_id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+        ]
+    )
+    qj = _run_query(client, sql, location=cfg.location, job_config=job_config)
+    qj.result()
+    if qj.num_dml_affected_rows is not None and qj.num_dml_affected_rows == 0:
+        raise ValueError("No task found with that service_request_id")
+    return {"ok": True, "service_request_id": task_id, "completed_by": str(claims.get("uid") or "")}
+
+
+def _delete_task(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    sra_t = _table_ref(_tasks_table_fqn(cfg, "service_request_assignees"))
+    sr_t = _table_ref(_tasks_table_fqn(cfg, "service_requests"))
+    task_id = str(req_body.get("service_request_id") or "").strip()
+    if not task_id:
+        raise ValueError("service_request_id is required")
+    del_assign = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+        ]
+    )
+    _run_query(
+        client,
+        f"DELETE FROM {sra_t} WHERE service_request_id = @service_request_id",
+        location=cfg.location,
+        job_config=del_assign,
+    ).result()
+    del_sr = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("service_request_id", "STRING", task_id),
+        ]
+    )
+    qj_sr = _run_query(
+        client,
+        f"DELETE FROM {sr_t} WHERE service_request_id = @service_request_id",
+        location=cfg.location,
+        job_config=del_sr,
+    )
+    qj_sr.result()
+    if qj_sr.num_dml_affected_rows is not None and qj_sr.num_dml_affected_rows == 0:
+        raise ValueError("No task found with that service_request_id")
+    return {"ok": True, "service_request_id": task_id, "deleted_by": str(claims.get("uid") or "")}
+
+
+@https_fn.on_request()
+def userTasksApi(req: https_fn.Request) -> https_fn.Response:
+    """Self-contained user/task CRUD for `users`, `service_requests`, `service_request_assignees`."""
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+    claims = _verify_firebase_user(req)
+    if claims is None:
+        return _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    cfg = bigquery_config_from_environ()
+    client = _bigquery_client(cfg)
+    try:
+        if req.method == "GET":
+            mode = str(_parse_query_param(req, "mode") or "all").strip().lower()
+            if mode == "users":
+                return _json_response(req, _list_users_payload(cfg, client), status=200)
+            if mode == "tasks":
+                return _json_response(req, _list_tasks_payload(cfg, client), status=200)
+            users_payload: dict[str, Any] = {"users": []}
+            tasks_payload: dict[str, Any] = {"tasks": []}
+            load_errors: dict[str, str] = {}
+            try:
+                users_payload = _list_users_payload(cfg, client)
+            except Exception as e:  # noqa: BLE001
+                load_errors["users"] = f"{type(e).__name__}: {e}"
+            try:
+                tasks_payload = _list_tasks_payload(cfg, client)
+            except Exception as e:  # noqa: BLE001
+                load_errors["tasks"] = f"{type(e).__name__}: {e}"
+            payload: dict[str, Any] = {**users_payload, **tasks_payload}
+            if load_errors:
+                payload["errors"] = load_errors
+            if len(load_errors) == 2:
+                return _json_response(
+                    req,
+                    {
+                        "error": "Failed to load users and tasks from BigQuery",
+                        "detail": str(load_errors),
+                        "errors": load_errors,
+                    },
+                    status=500,
+                )
+            return _json_response(req, payload, status=200)
+        if req.method != "POST":
+            return _json_response(req, {"error": "Method not allowed"}, status=405)
+        body = req.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip().lower()
+        if action == "create_user":
+            return _json_response(req, _create_user(body, claims, cfg, client), status=200)
+        if action == "create_task":
+            return _json_response(req, _create_task(body, claims, cfg, client), status=200)
+        if action == "assign_users":
+            return _json_response(req, _assign_task_users(body, claims, cfg, client), status=200)
+        if action == "complete_task":
+            return _json_response(req, _complete_task(body, claims, cfg, client), status=200)
+        if action == "delete_task":
+            return _json_response(req, _delete_task(body, claims, cfg, client), status=200)
+        return _json_response(req, {"error": "Bad request", "message": "Unknown action"}, status=400)
+    except ValueError as e:
+        return _json_response(req, {"error": "Bad request", "message": str(e)}, status=400)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("userTasksApi failed")
+        return _json_response(
+            req,
+            {"error": "Failed processing user tasks request", "detail": str(e), "error_type": type(e).__name__},
             status=500,
         )

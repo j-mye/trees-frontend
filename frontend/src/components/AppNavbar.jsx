@@ -13,6 +13,7 @@ export default function AppNavbar() {
   const onMap = pathname === '/' || pathname === '/dashboard'
   const onAnalytics = pathname === '/analytics'
   const onDataManagement = pathname === '/data-management'
+  const onUserTasks = pathname === '/user-tasks'
 
   return (
     <nav className="fixed top-0 z-[2000] flex h-16 w-full max-w-full items-center justify-between bg-slate-50/80 px-8 shadow-sm backdrop-blur-md">
@@ -32,6 +33,9 @@ export default function AppNavbar() {
           </Link>
           <Link to="/data-management" className={onDataManagement ? navActive : navInactive}>
             Data Management
+          </Link>
+          <Link to="/user-tasks" className={onUserTasks ? navActive : navInactive}>
+            User Tasks
           </Link>
           <a className={navInactive} href="#">
             Compliance

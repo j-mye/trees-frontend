@@ -44,6 +44,30 @@ The required many-to-many relationship is `service_requests` ↔ `users` via `se
 
 ---
 
+## 2.1 Non-legacy ERD (target schema only)
+
+Use this ERD for the production data model after legacy tables are renamed and excluded from app queries.
+
+```mermaid
+erDiagram
+    users ||--o{ service_requests : creates
+    users ||--o{ service_request_assignees : assigned
+    users ||--o{ tree_inspections : inspects
+
+    species ||--o{ trees_core : classifies
+    quarter_sections ||--|| qs_priority : rolled_up_in
+    quarter_sections ||--o{ trees_core : contains
+
+    trees_core ||--|| trees_features : extended_by
+    trees_core ||--o{ service_requests : has
+    trees_core ||--o{ tree_inspections : has
+    trees_core ||--o{ shap : explained_by
+
+    service_requests ||--o{ service_request_assignees : staffed_by
+```
+
+---
+
 ## 3. Renaming policy
 
 Only two renames, both at the API/JSON boundary so the frontend payload stays the same:
@@ -611,6 +635,78 @@ Data loading notebooks:
 
 - [database/bq-connection-writer.ipynb](database/bq-connection-writer.ipynb): raw ingest helper.
 - [database/schema_migration.ipynb](database/schema_migration.ipynb): authoritative refactor/cutover notebook.
+- [database/bq_constraints_and_validation.ipynb](database/bq_constraints_and_validation.ipynb): optional declarative PK/FK alters and **`ASSERT`** checks (BigQuery does not enforce FK/PK at insert time; use assertions or application logic).
+
+---
+
+## 7.1 Legacy-table rename only (no frontend changes required)
+
+If the goal is to keep current frontend/backend behavior unchanged while clearly isolating old data sources, rename old tables in-place instead of dropping them.
+
+### Rename plan
+
+- Rename `tree` -> `tree_legacy`
+- Rename `quarter_section` -> `quarter_section_legacy`
+- Rename `service_request` -> `service_request_legacy`
+- Rename `address` -> `address_legacy` (if present)
+
+### BigQuery SQL (safe pattern)
+
+BigQuery does not support a single `RENAME TABLE` statement across all environments in one consistent way, so the most portable approach is `CREATE TABLE AS SELECT` + `DROP TABLE`.
+
+```sql
+-- tree -> tree_legacy
+CREATE TABLE IF NOT EXISTS `mke-trees.mke_tree_dataset.tree_legacy` AS
+SELECT * FROM `mke-trees.mke_tree_dataset.tree`;
+DROP TABLE `mke-trees.mke_tree_dataset.tree`;
+```
+
+```sql
+-- quarter_section -> quarter_section_legacy
+CREATE TABLE IF NOT EXISTS `mke-trees.mke_tree_dataset.quarter_section_legacy` AS
+SELECT * FROM `mke-trees.mke_tree_dataset.quarter_section`;
+DROP TABLE `mke-trees.mke_tree_dataset.quarter_section`;
+```
+
+```sql
+-- service_request -> service_request_legacy
+CREATE TABLE IF NOT EXISTS `mke-trees.mke_tree_dataset.service_request_legacy` AS
+SELECT * FROM `mke-trees.mke_tree_dataset.service_request`;
+DROP TABLE `mke-trees.mke_tree_dataset.service_request`;
+```
+
+```sql
+-- address -> address_legacy (only if table exists)
+CREATE TABLE IF NOT EXISTS `mke-trees.mke_tree_dataset.address_legacy` AS
+SELECT * FROM `mke-trees.mke_tree_dataset.address`;
+DROP TABLE `mke-trees.mke_tree_dataset.address`;
+```
+
+### Post-rename verification
+
+```sql
+SELECT table_name
+FROM `mke-trees.mke_tree_dataset.INFORMATION_SCHEMA.TABLES`
+WHERE table_name IN (
+  'tree_legacy',
+  'quarter_section_legacy',
+  'service_request_legacy',
+  'address_legacy',
+  'trees_core',
+  'trees_features',
+  'quarter_sections',
+  'qs_priority',
+  'species',
+  'service_requests',
+  'service_request_assignees',
+  'tree_inspections',
+  'users',
+  'shap'
+)
+ORDER BY table_name;
+```
+
+Note: this section intentionally avoids frontend or endpoint changes.
 
 ---
 

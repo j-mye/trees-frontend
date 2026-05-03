@@ -5,6 +5,7 @@ import ErrorBoundary from './components/ErrorBoundary.jsx'
 import MapDashboardPage from './pages/MapDashboardPage.jsx'
 import AnalyticsPage from './pages/AnalyticsPage.jsx'
 import TreeRecordManagementPage from './pages/TreeRecordManagementPage.jsx'
+import UserTasksPage from './pages/UserTasksPage.jsx'
 import LoginPage from './pages/LoginPage.jsx'
 
 const FULL_BLEED_PATHS = [
@@ -15,6 +16,7 @@ const FULL_BLEED_PATHS = [
   '/risk-heatmap',
   '/analytics',
   '/data-management',
+  '/user-tasks',
   '/login',
 ]
 
@@ -70,6 +72,16 @@ export default function App() {
             <RequireAuth>
               <ErrorBoundary>
                 <TreeRecordManagementPage />
+              </ErrorBoundary>
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/user-tasks"
+          element={
+            <RequireAuth>
+              <ErrorBoundary>
+                <UserTasksPage />
               </ErrorBoundary>
             </RequireAuth>
           }
