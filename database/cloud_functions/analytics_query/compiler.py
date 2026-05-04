@@ -15,15 +15,26 @@ DIMENSION_TO_COLUMN: dict[str, str] = {
     "dim-district": "district",
     "dim-priority-level": "priority_level",
     "dim-inspection-year": "inspection_year",
+    "dim-tree-status": "tree_status",
+    "dim-risk-to-building": "risk_to_building",
+    "dim-maintenance-band": "maintenance_band",
 }
 
 MEASURE_TO_COLUMN: dict[str, str] = {
     "meas-tree-count": "tree_count",
     "meas-avg-dbh": "avg_dbh",
     "meas-max-priority": "Priority_Score_Normalized",
+    "meas-height": "height",
+    "meas-age": "age",
+    "meas-crown-width": "crown_diameter_m",
+    "meas-priority-score": "priority_score",
+    "meas-iof": "i_f",
+    "meas-p-f": "p_f",
+    "meas-age-prioritization": "age_prioritization",
 }
 
 AGG_FUNCS = frozenset({"SUM", "AVG", "COUNT", "MAX"})
+FILTER_OPS = frozenset({"eq", "gt", "gte", "lt", "lte"})
 
 
 def _safe_ident(name: str) -> str:
@@ -39,9 +50,26 @@ def _assert_allowed_column(col: str) -> str:
     return _safe_ident(col)
 
 
-def compile_draft_to_sql(draft: dict[str, Any], *, table_fqn: str) -> tuple[str, list[Any]]:
+def _normalize_dimension_expr(col: str) -> str:
+    safe = _assert_allowed_column(col)
+    return f"COALESCE(NULLIF(TRIM(CAST(`{safe}` AS STRING)), ''), 'Unknown')"
+
+
+def _number_or_none(v: Any) -> float | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def compile_draft_to_sql(draft: dict[str, Any], *, table_fqn: str) -> tuple[str, list[dict[str, Any]]]:
     """
-    Returns (sql, params) where params are empty (all literals from allowlist) — reserved for future binding.
+    Returns (sql, params) where params are BigQuery scalar parameter specs.
     """
     x = draft.get("xAxisItem") or {}
     y = draft.get("yAxisItem") or {}
@@ -58,6 +86,13 @@ def compile_draft_to_sql(draft: dict[str, Any], *, table_fqn: str) -> tuple[str,
 
     dim_col = _assert_allowed_column(DIMENSION_TO_COLUMN[xid])
     meas_col = _assert_allowed_column(MEASURE_TO_COLUMN[yid])
+    color_item = draft.get("colorItem") or {}
+    color_id = str(color_item.get("id") or "")
+    color_col = None
+    if color_id:
+        if color_id not in DIMENSION_TO_COLUMN:
+            raise ValueError(f"Unknown color dimension id {color_id!r}")
+        color_col = _assert_allowed_column(DIMENSION_TO_COLUMN[color_id])
 
     if not re.fullmatch(r"[\w`.:-]+", table_fqn):
         raise ValueError("Invalid table_fqn")
@@ -68,9 +103,59 @@ def compile_draft_to_sql(draft: dict[str, Any], *, table_fqn: str) -> tuple[str,
     else:
         agg_expr = f"{agg}(`{meas_col}`)"
 
-    dim_expr = f"COALESCE(NULLIF(TRIM(CAST(`{dim_col}` AS STRING)), ''), 'Unknown')"
-    sql = f"SELECT {dim_expr} AS xLabel, {agg_expr} AS yValue FROM `{table_fqn}` GROUP BY 1 ORDER BY 1"
-    return sql, []
+    x_expr = _normalize_dimension_expr(dim_col)
+    order_sql = "ORDER BY 1"
+
+    where_parts: list[str] = []
+    params: list[dict[str, Any]] = []
+    for i, raw_filter in enumerate(draft.get("draftFilters") or []):
+        if not isinstance(raw_filter, dict):
+            continue
+        field_id = str(raw_filter.get("fieldId") or "")
+        op = str(raw_filter.get("op") or "").lower()
+        value = raw_filter.get("value")
+        if not field_id or op not in FILTER_OPS:
+            continue
+        filter_col = DIMENSION_TO_COLUMN.get(field_id) or MEASURE_TO_COLUMN.get(field_id)
+        if not filter_col:
+            raise ValueError(f"Unknown filter field id {field_id!r}")
+        safe_filter_col = _assert_allowed_column(filter_col)
+        p_name = f"f_{i}"
+        if op == "eq":
+            n = _number_or_none(value)
+            if n is not None:
+                where_parts.append(f"SAFE_CAST(`{safe_filter_col}` AS FLOAT64) = @{p_name}")
+                params.append({"name": p_name, "type": "FLOAT64", "value": n})
+            else:
+                where_parts.append(f"{_normalize_dimension_expr(safe_filter_col)} = @{p_name}")
+                params.append({"name": p_name, "type": "STRING", "value": str(value or "").strip() or "Unknown"})
+            continue
+        n = _number_or_none(value)
+        if n is None:
+            raise ValueError(f"Filter {field_id!r} with op {op!r} requires numeric value")
+        op_sql = {  # nosec B608
+            "gt": ">",
+            "gte": ">=",
+            "lt": "<",
+            "lte": "<=",
+        }[op]
+        where_parts.append(f"SAFE_CAST(`{safe_filter_col}` AS FLOAT64) {op_sql} @{p_name}")
+        params.append({"name": p_name, "type": "FLOAT64", "value": n})
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    if color_col is not None:
+        color_expr = _normalize_dimension_expr(color_col)
+        order_sql = "ORDER BY 1, 3"
+        sql = (
+            f"SELECT {x_expr} AS xLabel, {agg_expr} AS yValue, {color_expr} AS series "
+            f"FROM `{table_fqn}` {where_sql} GROUP BY 1, 3 {order_sql}"
+        )
+    else:
+        sql = (
+            f"SELECT {x_expr} AS xLabel, {agg_expr} AS yValue FROM `{table_fqn}` {where_sql} GROUP BY 1 {order_sql}"
+        )
+    return sql, params
 
 
 def draft_cache_key(draft: dict[str, Any]) -> str:

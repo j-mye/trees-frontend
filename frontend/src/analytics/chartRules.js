@@ -10,11 +10,11 @@
 export function allowedChartTypes(draft) {
   const hasX = Boolean(draft.xAxisItem)
   const hasY = Boolean(draft.yAxisItem)
-  if (!hasX || !hasY) return ['bar', 'line', 'pie', 'scatter']
+  if (!hasX || !hasY) return ['bar', 'line', 'pie', 'scatter', 'histogram']
   /** @type {ChartType[]} */
-  const all = ['bar', 'line', 'pie', 'scatter']
+  const all = ['bar', 'line', 'pie', 'scatter', 'histogram']
   if (draft.colorItem) {
-    return all.filter((t) => t !== 'pie')
+    return all.filter((t) => t !== 'pie' && t !== 'histogram')
   }
   return all
 }

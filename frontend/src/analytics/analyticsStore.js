@@ -19,12 +19,37 @@ import { DRAFT_QUERY_VERSION } from './types.js'
 const LEGACY_STORAGE_KEY = 'trees_analytics_builder_v1'
 const PERSIST_NAME = 'trees-analytics-draft-v2'
 
+/** Renamed or removed catalog ids — drop from persisted pantry so UI stays aligned. */
+const OBSOLETE_VARIABLE_IDS = new Set(['meas-avg-height', 'meas-avg-age', 'meas-avg-crown-diameter'])
+
 function defaultDimensions() {
   return CATALOG_DIMENSIONS.map(catalogFieldToVariable)
 }
 
 function defaultMeasures() {
   return CATALOG_MEASURES.map(catalogFieldToVariable)
+}
+
+/**
+ * Merge latest catalog defaults into persisted arrays without removing user-added fields.
+ * @param {Variable[]} persisted
+ * @param {Variable[]} defaults
+ */
+function mergeCatalogVariables(persisted, defaults) {
+  const byId = new Map(
+    (persisted ?? [])
+      .filter((v) => v && typeof v.id === 'string' && !OBSOLETE_VARIABLE_IDS.has(v.id))
+      .map((v) => [v.id, v]),
+  )
+  for (const d of defaults) {
+    const existing = byId.get(d.id)
+    if (existing) {
+      byId.set(d.id, { ...existing, name: d.name, type: d.type })
+    } else {
+      byId.set(d.id, d)
+    }
+  }
+  return [...byId.values()]
 }
 
 /**
@@ -79,7 +104,9 @@ export const useAnalyticsDraftStore = create(
       setXAxisItem: (xAxisItem) =>
         set((s) => {
           const allowed = allowedChartTypes({ xAxisItem, yAxisItem: s.yAxisItem, colorItem: s.colorItem })
-          return { xAxisItem, chartType: pickLegalChartType(s.chartType, allowed) }
+          const preferred = 'bar'
+          const chartType = allowed.includes(preferred) ? preferred : pickLegalChartType(s.chartType, allowed)
+          return { xAxisItem, chartType }
         }),
       setYAxisItem: (yAxisItem) =>
         set((s) => {
@@ -167,6 +194,51 @@ export const useAnalyticsDraftStore = create(
         draftFilters: s.draftFilters,
         chartType: s.chartType,
       }),
+      onRehydrateStorage: () => (state) => {
+        if (!state) return
+        const mergedDimensions = mergeCatalogVariables(state.dimensions ?? [], defaultDimensions())
+        const mergedMeasures = mergeCatalogVariables(state.measures ?? [], defaultMeasures())
+        const patch = {
+          dimensions: mergedDimensions,
+          measures: mergedMeasures,
+        }
+        if (state.xAxisItem?.id && OBSOLETE_VARIABLE_IDS.has(state.xAxisItem.id)) {
+          patch.xAxisItem = null
+        } else if (state.xAxisItem?.id) {
+          const vx = variableInPool(state.xAxisItem, mergedDimensions, mergedMeasures)
+          if (vx) {
+            patch.xAxisItem = vx.type === 'measure' ? null : vx
+          }
+        }
+        if (state.yAxisItem?.id && OBSOLETE_VARIABLE_IDS.has(state.yAxisItem.id)) {
+          patch.yAxisItem = null
+          patch.yAggregation = 'SUM'
+        } else if (state.yAxisItem?.id) {
+          const vy = variableInPool(state.yAxisItem, mergedDimensions, mergedMeasures)
+          if (vy) patch.yAxisItem = vy
+        }
+        if (state.colorItem?.id && OBSOLETE_VARIABLE_IDS.has(state.colorItem.id)) {
+          patch.colorItem = null
+        } else if (state.colorItem?.id) {
+          const vc = variableInPool(state.colorItem, mergedDimensions, mergedMeasures)
+          if (vc) patch.colorItem = vc
+        }
+        if (Array.isArray(state.filterItems)) {
+          patch.filterItems = state.filterItems
+            .filter((v) => v?.id && !OBSOLETE_VARIABLE_IDS.has(v.id))
+            .map((v) => variableInPool(v, mergedDimensions, mergedMeasures))
+            .filter(Boolean)
+        }
+        if (Array.isArray(state.draftFilters)) {
+          patch.draftFilters = state.draftFilters.filter((f) => f?.fieldId && !OBSOLETE_VARIABLE_IDS.has(f.fieldId))
+        }
+        const yAfter = patch.yAxisItem ?? state.yAxisItem
+        const aggAfter = patch.yAggregation ?? state.yAggregation
+        if (aggAfter === 'VALUE' && yAfter) {
+          patch.yAggregation = defaultAggregationForMeasureId(yAfter.id)
+        }
+        useAnalyticsDraftStore.setState(patch)
+      },
     },
   ),
 )
@@ -213,7 +285,14 @@ export function migrateLegacyAnalyticsSnapshot(uid) {
         ? o.filterItems.filter(isVariableShape).map((v) => variableInPool(v, dims, meas)).filter(Boolean)
         : [],
       draftFilters: [],
-      chartType: o.chartType === 'bar' || o.chartType === 'line' || o.chartType === 'pie' || o.chartType === 'scatter' ? o.chartType : 'bar',
+      chartType:
+        o.chartType === 'bar' ||
+        o.chartType === 'line' ||
+        o.chartType === 'pie' ||
+        o.chartType === 'scatter' ||
+        o.chartType === 'histogram'
+          ? o.chartType
+          : 'bar',
     })
     sessionStorage.removeItem(LEGACY_STORAGE_KEY)
   } catch {

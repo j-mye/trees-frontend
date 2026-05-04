@@ -151,6 +151,15 @@ function parseCloudFunctionError(defaultMessage, error, fallbackBody = '') {
   return `${defaultMessage}${suffix}`
 }
 
+/** Badge styles for QS `priority_level` (aligned with map thresholds). */
+function priorityLevelBadgeClass(level) {
+  const l = String(level ?? '').trim().toLowerCase()
+  if (l === 'critical') return 'border border-red-200 bg-red-100 text-red-900'
+  if (l === 'high') return 'border border-orange-200 bg-orange-100 text-orange-950'
+  if (l === 'medium') return 'border border-amber-200 bg-amber-100 text-amber-950'
+  return 'border border-slate-200 bg-slate-100 text-slate-800'
+}
+
 export default function MapDashboardPage() {
   const { user, loading: authLoading } = useAuth()
   const [summary, setSummary] = useState(null)
@@ -173,6 +182,8 @@ export default function MapDashboardPage() {
   const [treePopup, setTreePopup] = useState(null)
   /** Site / tree id for SHAP explanation in the QS details card. */
   const [focusedTreeSiteId, setFocusedTreeSiteId] = useState(/** @type {string | null} */ (null))
+  /** Inventory: map vs ranked pruning-priority list (same data as map summaries / `qs_priority`). */
+  const [inventoryView, setInventoryView] = useState(/** @type {'map' | 'prune-queue'} */ ('map'))
   const mapRef = useRef(null)
 
   const summariesUrl = mapApiEnv.summariesUrl
@@ -353,6 +364,38 @@ export default function MapDashboardPage() {
       total_trees: overviewQsStatistics.total_trees,
     }
   }, [summary, qsMapGeojson, overviewQsStatistics])
+
+  /** Quarter sections that need attention next: same filters as the map, sorted by normalized priority score (desc). */
+  const pruningPriorityRows = useMemo(() => {
+    const features = Array.isArray(qsMapGeojson?.features) ? qsMapGeojson.features : []
+    const rows = []
+    for (const f of features) {
+      if (!featureMatchesScoreTreeMinFilters(f, mapControlFilterState)) continue
+      const p = f.properties || {}
+      const qsId = qsIdFromFeatureProperties(p)
+      if (!qsId) continue
+      const score = Number(p.Priority_Score_Normalized) || 0
+      const trees = Number(p.tree_count ?? p.total_trees ?? 0) || 0
+      rows.push({
+        qsId,
+        score,
+        priorityLevel: String(p.priority_level ?? p._map_level ?? '').trim() || 'Low',
+        district: String(p.district ?? 'Unknown'),
+        treeCount: trees,
+        topSpecies: String(p.top_species ?? 'Unknown'),
+        centerLat: p.center_lat != null ? Number(p.center_lat) : null,
+        centerLon: p.center_lon != null ? Number(p.center_lon) : null,
+        properties: p,
+      })
+    }
+    rows.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score
+      return a.qsId.localeCompare(b.qsId)
+    })
+    return rows
+  }, [qsMapGeojson, mapControlFilterState])
+
+  const sidebarWidthPx = panelOpen ? 360 : 56
 
   const loadFinishedOk = useMemo(
     () => !loading && !error && geojson != null && summary != null,
@@ -603,6 +646,26 @@ export default function MapDashboardPage() {
     }
   }
 
+  function focusQsFromPruningQueue(row) {
+    if (!row?.qsId) return
+    setInventoryView('map')
+    const selected = { ...row.properties, qs_id: row.qsId }
+    setFocusedTreeSiteId(null)
+    setSelectedQs(selected)
+    setQsDetailsExpanded(true)
+    setTreePopup(null)
+    void fetchTreesForQs(row.qsId)
+    const lat = row.centerLat
+    const lon = row.centerLon
+    requestAnimationFrame(() => {
+      const ref = mapRef.current
+      const map = ref && typeof ref.getMap === 'function' ? ref.getMap() : null
+      if (map && Number.isFinite(lat) && Number.isFinite(lon)) {
+        map.flyTo({ center: [lon, lat], zoom: 15, duration: 1000 })
+      }
+    })
+  }
+
   async function fetchTreesForQs(qs_id) {
     if (!qs_id) return
     setTreeFetchError('')
@@ -692,20 +755,24 @@ export default function MapDashboardPage() {
             No quarter sections have trees to display on the map.
           </div>
         ) : null}
-        {noQsMatchScoreTreeFilters ? (
+        {noQsMatchScoreTreeFilters && inventoryView === 'map' ? (
           <div className="absolute left-[380px] top-4 z-[1150] max-w-md rounded-xl border border-slate-200 bg-white/95 px-4 py-3 text-sm text-slate-800 shadow-xl backdrop-blur-sm">
             No quarter sections match the current map filters (priority score, minimum trees, or
             district). Adjust Map Controls to see polygons.
           </div>
         ) : null}
         
+        <div className="absolute inset-0">
         <Map
           ref={mapRef}
           initialViewState={{ latitude: mapCenter[0], longitude: mapCenter[1], zoom: DEFAULT_ZOOM }}
           mapStyle={DEFAULT_MAP_STYLE}
           style={{ width: '100%', height: '100%' }}
-          interactiveLayerIds={[TREE_LAYER_ID, QS_FILL_LAYER_ID]}
-          onClick={onMapClick}
+          interactiveLayerIds={
+            inventoryView === 'map' ? [TREE_LAYER_ID, QS_FILL_LAYER_ID] : []
+          }
+          onClick={inventoryView === 'map' ? onMapClick : undefined}
+          className={inventoryView === 'map' ? '' : 'pointer-events-none invisible'}
         >
           <NavigationControl position="bottom-right" />
           <Source
@@ -759,13 +826,118 @@ export default function MapDashboardPage() {
           ) : null}
         </Map>
 
+        {inventoryView === 'prune-queue' ? (
+          <div
+            className="absolute z-[500] overflow-auto bg-slate-50/96 backdrop-blur-sm"
+            style={{ left: sidebarWidthPx, top: 0, right: 0, bottom: 0 }}
+          >
+            <div className="mx-auto max-w-6xl px-4 py-6">
+              <div className="mb-4">
+                <h1 className="text-lg font-bold text-slate-900">Pruning priority</h1>
+                <p className="mt-1 text-sm text-slate-600">
+                  Quarter sections ranked by normalized priority score (
+                  <code className="rounded bg-slate-200/80 px-1 text-xs">Priority_Score_Normalized</code>
+                  ), matching the map data service and{' '}
+                  <code className="rounded bg-slate-200/80 px-1 text-xs">qs_priority</code>. Uses the same
+                  filters as Map Controls.
+                </p>
+              </div>
+              {loadFinishedOk && pruningPriorityRows.length === 0 ? (
+                <div className="rounded-xl border border-slate-200 bg-white px-4 py-8 text-center text-sm text-slate-600">
+                  No quarter sections match the current filters. Adjust district, priority range, or minimum
+                  trees in the sidebar.
+                </div>
+              ) : (
+                <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                  <div className="max-h-[calc(100vh-14rem)] overflow-auto">
+                    <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                      <thead className="sticky top-0 z-10 border-b border-slate-200 bg-slate-100/95 backdrop-blur-sm">
+                        <tr className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                          <th className="px-3 py-3">#</th>
+                          <th className="px-3 py-3">Quarter section</th>
+                          <th className="px-3 py-3">Score</th>
+                          <th className="px-3 py-3">Level</th>
+                          <th className="px-3 py-3">District</th>
+                          <th className="px-3 py-3 text-right">Trees</th>
+                          <th className="px-3 py-3">Top species</th>
+                          <th className="px-3 py-3 w-32"> </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 text-slate-800">
+                        {pruningPriorityRows.map((row, i) => (
+                          <tr key={row.qsId} className="hover:bg-slate-50/80">
+                            <td className="whitespace-nowrap px-3 py-2.5 text-slate-500">{i + 1}</td>
+                            <td className="px-3 py-2.5 font-semibold text-slate-900">{row.qsId}</td>
+                            <td className="whitespace-nowrap px-3 py-2.5 font-mono tabular-nums">
+                              {row.score.toFixed(1)}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <span
+                                className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-bold ${priorityLevelBadgeClass(row.priorityLevel)}`}
+                              >
+                                {row.priorityLevel}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2.5 text-slate-700">{row.district}</td>
+                            <td className="px-3 py-2.5 text-right tabular-nums">{row.treeCount}</td>
+                            <td className="max-w-[180px] truncate px-3 py-2.5 text-slate-600" title={row.topSpecies}>
+                              {row.topSpecies}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <button
+                                type="button"
+                                className="rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white transition-colors hover:bg-indigo-700"
+                                onClick={() => focusQsFromPruningQueue(row)}
+                              >
+                                Map
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
+        </div>
+
         <div className={`absolute left-0 top-0 bottom-0 z-[1000] flex flex-col border-r border-slate-200/60 bg-white/95 shadow-[4px_0_24px_rgba(0,0,0,0.05)] backdrop-blur-xl transition-all duration-300 ease-in-out ${panelOpen ? 'w-[360px]' : 'w-14'}`}>
           {/* Panel Header & Toggle */}
           <div className={`flex items-center justify-between border-b border-slate-200/60 px-4 py-4 bg-slate-50/50 ${!panelOpen ? 'justify-center' : ''}`}>
             {panelOpen && (
-              <div>
+              <div className="min-w-0 flex-1 pr-2">
                 <h2 className="text-sm !font-bold !text-slate-800">Milwaukee Tree Priority Map</h2>
-                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mt-0.5">Map Controls</p>
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mt-0.5">
+                  Inventory
+                </p>
+                <div className="mt-3 flex gap-1 rounded-lg bg-slate-200/60 p-0.5">
+                  <button
+                    type="button"
+                    className={`flex-1 rounded-md px-2 py-1.5 text-[11px] font-bold transition-colors ${
+                      inventoryView === 'map'
+                        ? 'bg-white text-indigo-700 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                    onClick={() => setInventoryView('map')}
+                  >
+                    Map
+                  </button>
+                  <button
+                    type="button"
+                    className={`flex-1 rounded-md px-2 py-1.5 text-[11px] font-bold transition-colors ${
+                      inventoryView === 'prune-queue'
+                        ? 'bg-white text-indigo-700 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                    onClick={() => setInventoryView('prune-queue')}
+                    title="Quarter sections to prune next, by priority score"
+                  >
+                    Prune next
+                  </button>
+                </div>
               </div>
             )}
             <button
@@ -777,6 +949,35 @@ export default function MapDashboardPage() {
               <span className="material-symbols-outlined">{panelOpen ? 'keyboard_double_arrow_left' : 'keyboard_double_arrow_right'}</span>
             </button>
           </div>
+
+          {!panelOpen ? (
+            <div className="flex flex-col items-center gap-1 border-b border-slate-200/60 py-2">
+              <button
+                type="button"
+                className={`flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
+                  inventoryView === 'map'
+                    ? 'bg-indigo-100 text-indigo-700'
+                    : 'text-slate-500 hover:bg-slate-100 hover:text-slate-800'
+                }`}
+                title="Map"
+                onClick={() => setInventoryView('map')}
+              >
+                <span className="material-symbols-outlined text-xl leading-none">map</span>
+              </button>
+              <button
+                type="button"
+                className={`flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
+                  inventoryView === 'prune-queue'
+                    ? 'bg-indigo-100 text-indigo-700'
+                    : 'text-slate-500 hover:bg-slate-100 hover:text-slate-800'
+                }`}
+                title="Pruning priority list"
+                onClick={() => setInventoryView('prune-queue')}
+              >
+                <span className="material-symbols-outlined text-xl leading-none">format_list_numbered</span>
+              </button>
+            </div>
+          ) : null}
 
           {/* Scrollable Content Area */}
           {panelOpen && (

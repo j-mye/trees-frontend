@@ -67,6 +67,12 @@ function ChartToggleButton({ t, icon, label, chartType, onChartType, allowedChar
  * @param {() => void} props.onFullscreen
  * @param {() => void} props.onExportCsv
  * @param {boolean} props.exportDisabled
+ * @param {{
+ *   rowsReturned: number
+ *   chartMaxPoints: number
+ *   chartSampled: boolean
+ *   chartOriginalCount: number
+ * } | null | undefined} props.resultMeta
  */
 export function CanvasPane({
   canvasSectionRef,
@@ -84,6 +90,7 @@ export function CanvasPane({
   onFullscreen,
   onExportCsv,
   exportDisabled,
+  resultMeta = null,
 }) {
   const [tableOpen, setTableOpen] = useState(false)
 
@@ -121,8 +128,17 @@ export function CanvasPane({
                 </div>
               </>
             ) : (
-              <div className={`h-[450px] w-full shrink-0 ${chartCardContentInset}`}>
-                <div className="h-full w-full min-h-0 min-w-0">
+              <div className={`flex h-[450px] w-full shrink-0 flex-col ${chartCardContentInset}`}>
+                {resultMeta?.chartSampled ? (
+                  <div className="mb-2 shrink-0 rounded-lg border border-amber-200/90 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-950">
+                    <span>
+                      Chart and table use {rows.length.toLocaleString()} of{' '}
+                      {resultMeta.chartOriginalCount.toLocaleString()} points (browser cap ~{' '}
+                      {resultMeta.chartMaxPoints.toLocaleString()}).
+                    </span>
+                  </div>
+                ) : null}
+                <div className="min-h-0 min-w-0 flex-1">
                   <ChartPreview chartType={chartType} rows={rows} xAxisTitle={xAxisTitle} yAxisTitle={yAxisTitle} />
                 </div>
               </div>
@@ -201,6 +217,15 @@ export function CanvasPane({
             t="scatter"
             icon="scatter_plot"
             label="Scatter"
+            chartType={chartType}
+            onChartType={onChartType}
+            allowedChartTypes={allowedChartTypes}
+            chartDisabledReason={chartDisabledReason}
+          />
+          <ChartToggleButton
+            t="histogram"
+            icon="stacked_bar_chart"
+            label="Histogram"
             chartType={chartType}
             onChartType={onChartType}
             allowedChartTypes={allowedChartTypes}

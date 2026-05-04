@@ -5,7 +5,7 @@
  * @typedef {'SUM' | 'AVG' | 'COUNT' | 'MAX'} Aggregation
  * @typedef {'eq' | 'gt' | 'lt' | 'gte' | 'lte'} FilterOp
  * @typedef {{ fieldId: string, op: FilterOp, value: string }} DraftFilter
- * @typedef {'bar' | 'line' | 'pie' | 'scatter'} ChartType
+ * @typedef {'bar' | 'line' | 'pie' | 'scatter' | 'histogram'} ChartType
  */
 
 export const DRAFT_QUERY_VERSION = 2

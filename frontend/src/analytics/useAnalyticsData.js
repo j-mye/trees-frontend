@@ -5,6 +5,10 @@ import { executeClientAnalyticsQuery } from './clientAggregate.js'
 import { serializeDraftQuery } from './draftSerialize.js'
 import { sanitizeChartRowsForDisplay } from './sanitizeChart.js'
 import { fetchAnalyticsQueryRemote } from './remoteAnalytics.js'
+import { downsampleChartRows } from './chartSample.js'
+
+/** Max points passed to Recharts (memory + paint). */
+const CHART_MAX_POINTS = 3500
 
 /**
  * @param {{ properties?: object }[]} rows
@@ -67,6 +71,19 @@ export function useRunAnalyticsMutation(opts) {
     mutationFn: async (/** @type {{ features: { properties?: object }[] }} */ payload) => {
       const draft = opts.getDraft()
       const { xAxisItem, yAxisItem, yAggregation, colorItem, draftFilters, chartType } = draft
+      const remoteEnabled = Boolean(mapApiEnv.analyticsQueryUrl && user)
+      console.info('[analytics] run start', {
+        mode: remoteEnabled ? 'remote' : 'client',
+        analyticsQueryUrl: mapApiEnv.analyticsQueryUrl || null,
+        summariesUrl: mapApiEnv.summariesUrl || null,
+        featuresCount: Array.isArray(payload.features) ? payload.features.length : 0,
+        xAxisItem: xAxisItem?.id ?? null,
+        yAxisItem: yAxisItem?.id ?? null,
+        yAggregation,
+        colorItem: colorItem?.id ?? null,
+        draftFilters,
+        chartType,
+      })
       if (!xAxisItem || !yAxisItem || !yAggregation) {
         throw new Error('Incomplete draft')
       }
@@ -87,7 +104,25 @@ export function useRunAnalyticsMutation(opts) {
               draft: { xAxisItem, yAxisItem, yAggregation, colorItem, draftFilters, chartType },
             })
             const shaped = sanitizeChartRowsForDisplay(rowsToChartShape(remote.rows))
-            return { rows: shaped, source: remote.source ?? 'remote' }
+            const { rows: chartRows, sampled, originalCount } = downsampleChartRows(shaped, CHART_MAX_POINTS)
+            console.info('[analytics] run success', {
+              mode: 'remote',
+              responseSource: remote.source ?? 'remote',
+              rowsRaw: Array.isArray(remote.rows) ? remote.rows.length : 0,
+              rowsShaped: shaped.length,
+              chartPoints: chartRows.length,
+              chartSampled: sampled,
+            })
+            return {
+              rows: chartRows,
+              source: remote.source ?? 'remote',
+              meta: {
+                rowsReturned: shaped.length,
+                chartMaxPoints: CHART_MAX_POINTS,
+                chartSampled: sampled,
+                chartOriginalCount: originalCount,
+              },
+            }
           }
           const rows = executeClientAnalyticsQuery({
             features: payload.features,
@@ -97,7 +132,28 @@ export function useRunAnalyticsMutation(opts) {
             colorItem,
             draftFilters,
           })
-          return { rows, source: 'client' }
+          const {
+            rows: chartRowsClient,
+            sampled: sampledClient,
+            originalCount: originalCountClient,
+          } = downsampleChartRows(rows, CHART_MAX_POINTS)
+          console.info('[analytics] run success', {
+            mode: 'client',
+            rowsCount: rows.length,
+            chartPoints: chartRowsClient.length,
+            chartSampled: sampledClient,
+            preview: chartRowsClient.slice(0, 5),
+          })
+          return {
+            rows: chartRowsClient,
+            source: 'client',
+            meta: {
+              rowsReturned: rows.length,
+              chartMaxPoints: CHART_MAX_POINTS,
+              chartSampled: sampledClient,
+              chartOriginalCount: originalCountClient,
+            },
+          }
         },
       })
     },

@@ -75,6 +75,20 @@ def analytics_query(request: Request):
         draft = body.get("draft")
         if not isinstance(draft, dict):
             return (jsonify({"error": "Missing draft object"}), 400, CORS_HEADERS)
+        print(
+            "[analytics_query] incoming draft",
+            json.dumps(
+                {
+                    "xAxisItem": (draft.get("xAxisItem") or {}).get("id"),
+                    "yAxisItem": (draft.get("yAxisItem") or {}).get("id"),
+                    "yAggregation": draft.get("yAggregation"),
+                    "colorItem": (draft.get("colorItem") or {}).get("id"),
+                    "filters": draft.get("draftFilters") or [],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     except Exception as e:
         return (jsonify({"error": str(e)}), 400, CORS_HEADERS)
 
@@ -86,7 +100,20 @@ def analytics_query(request: Request):
 
     try:
         table_fqn = _table_fqn()
-        sql, _params = compile_draft_to_sql(draft, table_fqn=table_fqn)
+        sql, param_specs = compile_draft_to_sql(draft, table_fqn=table_fqn)
+        print(
+            "[analytics_query] compiled",
+            json.dumps(
+                {
+                    "table_fqn": table_fqn,
+                    "params": param_specs,
+                    "sql_preview": sql[:500],
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            flush=True,
+        )
     except ValueError as e:
         return (jsonify({"error": str(e)}), 400, CORS_HEADERS)
 
@@ -97,17 +124,39 @@ def analytics_query(request: Request):
 
     try:
         client = bigquery.Client()
-        job = client.query(sql)
+        bq_params: list[bigquery.ScalarQueryParameter] = []
+        for p in param_specs:
+            bq_params.append(
+                bigquery.ScalarQueryParameter(
+                    str(p["name"]),
+                    str(p["type"]),
+                    p.get("value"),
+                )
+            )
+        job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=bq_params))
         rows_out: list[dict[str, Any]] = []
         for r in job.result():
             y_raw = r["yValue"]
             y_val = float(y_raw) if y_raw is not None and str(y_raw).strip() != "" else 0.0
-            rows_out.append(
+            out_row = {
+                "xLabel": _normalize_tabular_xlabel(r["xLabel"]),
+                "yValue": y_val,
+            }
+            if "series" in r:
+                out_row["series"] = _normalize_tabular_xlabel(r["series"])
+            rows_out.append(out_row)
+        print(
+            "[analytics_query] query result",
+            json.dumps(
                 {
-                    "xLabel": _normalize_tabular_xlabel(r["xLabel"]),
-                    "yValue": y_val,
-                }
-            )
+                    "rows_count": len(rows_out),
+                    "preview": rows_out[:5],
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            flush=True,
+        )
     except Exception as e:
         return (jsonify({"error": "BigQuery error", "message": str(e)}), 500, CORS_HEADERS)
 

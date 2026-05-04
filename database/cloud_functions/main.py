@@ -73,6 +73,10 @@ from google.oauth2 import service_account
 import cached_http
 
 set_global_options(max_instances=10)
+
+# Public Cloud Run invoker: browser preflight (OPTIONS) has no Firebase token; private invoker
+# returns 403 without app CORS headers. Do not combine @https_fn.on_request(cors=...) with
+# _json_response()'s _cors_headers — that duplicates Access-Control-Allow-Origin and breaks CORS.
 # Prefer key beside this file; fallback to database/serviceAccountKey.json
 _SERVICE_ACCOUNT_LOCAL = os.path.join(_BASE_DIR, "serviceAccountKey.json")
 _SERVICE_ACCOUNT_PARENT = os.path.join(os.path.dirname(_BASE_DIR), "serviceAccountKey.json")
@@ -448,6 +452,7 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
     qs_t = _table_ref(cfg.qs_table_fqn)
     tree_t = _table_ref(cfg.trees_table_fqn)
     qsp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.qs_priority")
+    sp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
     id_col = cfg.qs_join_column
     gcol = cfg.qs_geometry_column
     tqs = cfg.tree_qs_id_column
@@ -456,8 +461,22 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
       SELECT
         TRIM(CAST({tqs} AS STRING)) AS clean_site_id,
         COUNT(*) AS tree_count,
-        AVG(CAST(dbh AS FLOAT64)) AS avg_dbh
-      FROM {tree_t}
+        AVG(CAST(dbh AS FLOAT64)) AS avg_dbh,
+        APPROX_TOP_COUNT(
+          COALESCE(NULLIF(TRIM(CAST(COALESCE(s.simple_species, s.common_name, s.full_name, s.scientific_name) AS STRING)), ''), 'Unknown')
+          , 1
+        )[OFFSET(0)].value AS top_species,
+        CAST(
+          MAX(
+            SAFE_CAST(
+              REGEXP_EXTRACT(CAST(t.inventory_date AS STRING), r'(19\\d{{2}}|20\\d{{2}})')
+              AS INT64
+            )
+          ) AS STRING
+        ) AS inspection_year
+      FROM {tree_t} AS t
+      LEFT JOIN {sp_t} s
+        ON t.species_id = s.species_id
       GROUP BY clean_site_id
     )
     SELECT
@@ -471,6 +490,8 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
       CAST(COALESCE(ts.tree_count, 0) AS INT64) AS tree_count,
       CAST(COALESCE(ts.tree_count, 0) AS INT64) AS total_trees,
       CAST(COALESCE(ts.avg_dbh, 0.0) AS FLOAT64) AS avg_dbh,
+      CAST(COALESCE(ts.top_species, "Unknown") AS STRING) AS top_species,
+      CAST(COALESCE(ts.inspection_year, "Unknown") AS STRING) AS inspection_year,
       CAST(COALESCE(qs.district, "Unknown") AS STRING) AS district,
       CAST(qs.{gcol} AS STRING) AS geom_json,
       ST_X(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))) AS center_lon,
@@ -631,6 +652,8 @@ def _summaries_payload_from_bigquery(
                 "PS_composite": ps_composite,
                 "Priority_Score_Normalized": priority_score_normalized,
                 "priority_level": _priority_level_from_score(priority_score_normalized),
+                "top_species": str(row["top_species"] or "Unknown"),
+                "inspection_year": str(row["inspection_year"] or "Unknown"),
                 "center_lat": clat,
                 "center_lon": clon,
                 "district": str(row["district"] or "Unknown"),
@@ -1262,6 +1285,466 @@ def _delete_task(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQuery
     return {"ok": True, "service_request_id": task_id, "deleted_by": str(claims.get("uid") or "")}
 
 
+def _safe_tree_id_param(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._\-]{1,256}", s):
+        raise ValueError("tree_id must be 1-256 characters: letters, digits, . _ -")
+    return s
+
+
+def _trees_core_qs_column(cfg: BigQueryEnvConfig) -> str:
+    col = (cfg.tree_qs_id_column or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", col):
+        return "qs_id"
+    return col
+
+
+def _trees_features_table_ref(cfg: BigQueryEnvConfig) -> str:
+    return _table_ref(f"{cfg.project_id}.{cfg.dataset}.trees_features")
+
+
+def _list_species_short_payload(cfg: BigQueryEnvConfig, client: bigquery.Client, limit: int) -> dict[str, Any]:
+    lim = min(max(int(limit or 500), 1), 3000)
+    species_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
+    sql = f"""
+    SELECT
+      CAST(s.species_id AS INT64) AS species_id,
+      CAST(
+        COALESCE(
+          NULLIF(TRIM(s.simple_species), ''),
+          NULLIF(TRIM(s.full_name), ''),
+          NULLIF(TRIM(s.scientific_name), ''),
+          CAST(s.species_id AS STRING)
+        ) AS STRING
+      ) AS label
+    FROM {species_t} AS s
+    ORDER BY label
+    LIMIT {lim}
+    """
+    rows = list(_run_query(client, sql, location=cfg.location).result())
+    species: list[dict[str, Any]] = []
+    for r in rows:
+        sid = r.get("species_id")
+        if sid is None:
+            continue
+        species.append({"species_id": int(sid), "label": str(r.get("label") or "")})
+    return {"species": species}
+
+
+def _get_tree_core_row(cfg: BigQueryEnvConfig, client: bigquery.Client, tree_id: str) -> dict[str, Any]:
+    t = _table_ref(cfg.trees_table_fqn)
+    sp = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
+    qc = _trees_core_qs_column(cfg)
+    sql = f"""
+    SELECT
+      CAST(t.tree_id AS STRING) AS tree_id,
+      CAST(t.site_id AS STRING) AS site_id,
+      CAST(t.{qc} AS STRING) AS qs_id,
+      t.species_id AS species_id,
+      CAST(COALESCE(s.simple_species, s.full_name, s.scientific_name, '') AS STRING) AS species_label,
+      SAFE_CAST(t.latitude AS FLOAT64) AS latitude,
+      SAFE_CAST(t.longitude AS FLOAT64) AS longitude,
+      SAFE_CAST(t.dbh AS FLOAT64) AS dbh,
+      SAFE_CAST(t.height AS FLOAT64) AS height,
+      CAST(COALESCE(CAST(t.condition_aerial AS STRING), '') AS STRING) AS condition_aerial,
+      CAST(COALESCE(CAST(t.inventory_date AS STRING), '') AS STRING) AS inventory_date,
+      SAFE_CAST(t.years_since_pruned AS INT64) AS years_since_pruned,
+      SAFE_CAST(t.maintenance_deficit AS INT64) AS maintenance_deficit,
+      SAFE_CAST(t.age AS FLOAT64) AS age,
+      t.can_strike_building AS can_strike_building,
+      SAFE_CAST(t.crown_diameter_m AS FLOAT64) AS crown_diameter_m,
+      CAST(COALESCE(CAST(t.missing_or_dead AS STRING), '') AS STRING) AS missing_or_dead,
+      CAST(COALESCE(CAST(t.status AS STRING), '') AS STRING) AS status
+    FROM {t} AS t
+    LEFT JOIN {sp} AS s ON t.species_id = s.species_id
+    WHERE CAST(t.tree_id AS STRING) = @tree_id
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id)]
+    )
+    rows = list(_run_query(client, sql, location=cfg.location, job_config=job_config).result())
+    if not rows:
+        raise ValueError("Tree not found")
+    r = rows[0]
+    return {
+        "tree_id": str(r["tree_id"] or ""),
+        "site_id": str(r["site_id"] or ""),
+        "qs_id": str(r["qs_id"] or ""),
+        "species_id": int(r["species_id"]) if r["species_id"] is not None else None,
+        "species_label": str(r["species_label"] or ""),
+        "latitude": _optional_float_for_json(r.get("latitude")),
+        "longitude": _optional_float_for_json(r.get("longitude")),
+        "dbh": float(r["dbh"] or 0.0) if r["dbh"] is not None else None,
+        "height": _optional_float_for_json(r.get("height")),
+        "condition_aerial": str(r["condition_aerial"] or ""),
+        "inventory_date": str(r["inventory_date"] or ""),
+        "years_since_pruned": int(r["years_since_pruned"] or 0) if r["years_since_pruned"] is not None else None,
+        "maintenance_deficit": int(r["maintenance_deficit"] or 0) if r["maintenance_deficit"] is not None else None,
+        "age": _optional_float_for_json(r.get("age")),
+        "can_strike_building": bool(r["can_strike_building"]) if r["can_strike_building"] is not None else False,
+        "crown_diameter_m": _optional_float_for_json(r.get("crown_diameter_m")),
+        "missing_or_dead": str(r["missing_or_dead"] or ""),
+        "status": str(r["status"] or ""),
+    }
+
+
+def _create_tree_core(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    tid = str(req_body.get("tree_id") or "").strip()
+    tree_id = _safe_tree_id_param(tid if tid else uuid.uuid4().hex[:28])
+    qc = _trees_core_qs_column(cfg)
+    qs_id = str(req_body.get("qs_id") or "").strip()
+    if not qs_id:
+        raise ValueError("qs_id is required")
+    lat = float(req_body.get("latitude"))
+    lon = float(req_body.get("longitude"))
+    if lat != lat or lon != lon:
+        raise ValueError("latitude and longitude must be numbers")
+    dbh_f = float(req_body.get("dbh") or 0)
+    dbh_i = int(round(dbh_f))
+    species_raw = req_body.get("species_id")
+    if species_raw is None or str(species_raw).strip() == "":
+        raise ValueError("species_id is required for new inventory rows")
+    species_id = int(species_raw)
+    height_ins = _optional_float_for_json(req_body.get("height"))
+    condition_aerial = str(req_body.get("condition_aerial") or "Unknown").strip() or "Unknown"
+    inventory_date = str(req_body.get("inventory_date") or "").strip()
+    years_since_pruned = int(req_body.get("years_since_pruned") or 0)
+    maintenance_deficit = int(req_body.get("maintenance_deficit") or 0)
+    age = _optional_float_for_json(req_body.get("age")) or 0.0
+    can_strike = bool(req_body.get("can_strike_building"))
+    crown_m = float(req_body.get("crown_diameter_m") or 0.0)
+    missing_or_dead = str(req_body.get("missing_or_dead") or "").strip()
+    site_id = str(req_body.get("site_id") or tree_id).strip() or tree_id
+    status = str(req_body.get("status") or "Active").strip() or "Active"
+    t = _table_ref(cfg.trees_table_fqn)
+    sql = f"""
+    INSERT INTO {t} (
+      tree_id,
+      site_id,
+      {qc},
+      species_id,
+      status,
+      created_at,
+      updated_at,
+      latitude,
+      longitude,
+      dbh,
+      height,
+      condition_aerial,
+      inventory_date,
+      years_since_pruned,
+      maintenance_deficit,
+      age,
+      can_strike_building,
+      crown_diameter_m,
+      missing_or_dead
+    )
+    VALUES (
+      @tree_id,
+      @site_id,
+      @qs_id,
+      @species_id,
+      @status,
+      CURRENT_TIMESTAMP(),
+      CURRENT_TIMESTAMP(),
+      @latitude,
+      @longitude,
+      @dbh,
+      @height,
+      @condition_aerial,
+      @inventory_date,
+      @years_since_pruned,
+      @maintenance_deficit,
+      @age,
+      @can_strike_building,
+      @crown_diameter_m,
+      @missing_or_dead
+    )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id),
+            bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
+            bigquery.ScalarQueryParameter("qs_id", "STRING", qs_id),
+            bigquery.ScalarQueryParameter("species_id", "INT64", species_id),
+            bigquery.ScalarQueryParameter("status", "STRING", status),
+            bigquery.ScalarQueryParameter("latitude", "FLOAT64", lat),
+            bigquery.ScalarQueryParameter("longitude", "FLOAT64", lon),
+            bigquery.ScalarQueryParameter("dbh", "INT64", dbh_i),
+            bigquery.ScalarQueryParameter("height", "FLOAT64", height_ins),
+            bigquery.ScalarQueryParameter("condition_aerial", "STRING", condition_aerial),
+            bigquery.ScalarQueryParameter("inventory_date", "STRING", inventory_date),
+            bigquery.ScalarQueryParameter("years_since_pruned", "INT64", years_since_pruned),
+            bigquery.ScalarQueryParameter("maintenance_deficit", "INT64", maintenance_deficit),
+            bigquery.ScalarQueryParameter("age", "FLOAT64", float(age)),
+            bigquery.ScalarQueryParameter("can_strike_building", "BOOL", can_strike),
+            bigquery.ScalarQueryParameter("crown_diameter_m", "FLOAT64", crown_m),
+            bigquery.ScalarQueryParameter("missing_or_dead", "STRING", missing_or_dead),
+        ]
+    )
+    _run_query(client, sql, location=cfg.location, job_config=job_config).result()
+    return {"ok": True, "tree_id": tree_id, "created_by": str(claims.get("uid") or "")}
+
+
+def _update_tree_core(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    tree_id = _safe_tree_id_param(req_body.get("tree_id"))
+    qc = _trees_core_qs_column(cfg)
+    qs_id = str(req_body.get("qs_id") or "").strip()
+    if not qs_id:
+        raise ValueError("qs_id is required")
+    lat = float(req_body.get("latitude"))
+    lon = float(req_body.get("longitude"))
+    if lat != lat or lon != lon:
+        raise ValueError("latitude and longitude must be numbers")
+    dbh_i = int(round(float(req_body.get("dbh") or 0)))
+    species_raw = req_body.get("species_id")
+    species_id_param: int | None
+    if species_raw is None or str(species_raw).strip() == "":
+        species_id_param = None
+    else:
+        species_id_param = int(species_raw)
+    height_upd = _optional_float_for_json(req_body.get("height"))
+    condition_aerial = str(req_body.get("condition_aerial") or "").strip()
+    inventory_date = str(req_body.get("inventory_date") or "").strip()
+    years_since_pruned = int(req_body.get("years_since_pruned") or 0)
+    maintenance_deficit = int(req_body.get("maintenance_deficit") or 0)
+    age = _optional_float_for_json(req_body.get("age")) or 0.0
+    can_strike = bool(req_body.get("can_strike_building"))
+    crown_m = float(req_body.get("crown_diameter_m") or 0.0)
+    missing_or_dead = str(req_body.get("missing_or_dead") or "").strip()
+    status = str(req_body.get("status") or "").strip()
+    t = _table_ref(cfg.trees_table_fqn)
+    status_sql = ", status = @status" if status else ""
+    sql = f"""
+    UPDATE {t}
+    SET
+      {qc} = @qs_id,
+      latitude = @latitude,
+      longitude = @longitude,
+      dbh = @dbh,
+      height = @height,
+      species_id = @species_id,
+      condition_aerial = @condition_aerial,
+      inventory_date = @inventory_date,
+      years_since_pruned = @years_since_pruned,
+      maintenance_deficit = @maintenance_deficit,
+      age = @age,
+      can_strike_building = @can_strike_building,
+      crown_diameter_m = @crown_diameter_m,
+      missing_or_dead = @missing_or_dead,
+      updated_at = CURRENT_TIMESTAMP(){status_sql}
+    WHERE CAST(tree_id AS STRING) = @tree_id
+    """
+    params: list[bigquery.ScalarQueryParameter] = [
+        bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id),
+        bigquery.ScalarQueryParameter("qs_id", "STRING", qs_id),
+        bigquery.ScalarQueryParameter("latitude", "FLOAT64", lat),
+        bigquery.ScalarQueryParameter("longitude", "FLOAT64", lon),
+        bigquery.ScalarQueryParameter("dbh", "INT64", dbh_i),
+        bigquery.ScalarQueryParameter("height", "FLOAT64", height_upd),
+        bigquery.ScalarQueryParameter("species_id", "INT64", species_id_param),
+        bigquery.ScalarQueryParameter("condition_aerial", "STRING", condition_aerial),
+        bigquery.ScalarQueryParameter("inventory_date", "STRING", inventory_date),
+        bigquery.ScalarQueryParameter("years_since_pruned", "INT64", years_since_pruned),
+        bigquery.ScalarQueryParameter("maintenance_deficit", "INT64", maintenance_deficit),
+        bigquery.ScalarQueryParameter("age", "FLOAT64", float(age)),
+        bigquery.ScalarQueryParameter("can_strike_building", "BOOL", can_strike),
+        bigquery.ScalarQueryParameter("crown_diameter_m", "FLOAT64", crown_m),
+        bigquery.ScalarQueryParameter("missing_or_dead", "STRING", missing_or_dead),
+    ]
+    if status:
+        params.append(bigquery.ScalarQueryParameter("status", "STRING", status))
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    qj = _run_query(client, sql, location=cfg.location, job_config=job_config)
+    qj.result()
+    if qj.num_dml_affected_rows is not None and qj.num_dml_affected_rows == 0:
+        raise ValueError("Tree not found or not updated")
+    return {"ok": True, "tree_id": tree_id, "updated_by": str(claims.get("uid") or "")}
+
+
+def _delete_tree_core(req_body: dict[str, Any], claims: dict[str, Any], cfg: BigQueryEnvConfig, client: bigquery.Client) -> dict[str, Any]:
+    tree_id = _safe_tree_id_param(req_body.get("tree_id"))
+    t = _table_ref(cfg.trees_table_fqn)
+    feat = _trees_features_table_ref(cfg)
+    del_feat = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id)]
+    )
+    _run_query(client, f"DELETE FROM {feat} WHERE tree_id = @tree_id", location=cfg.location, job_config=del_feat).result()
+    del_core = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("tree_id", "STRING", tree_id)]
+    )
+    qj = _run_query(client, f"DELETE FROM {t} WHERE tree_id = @tree_id", location=cfg.location, job_config=del_core)
+    qj.result()
+    if qj.num_dml_affected_rows is not None and qj.num_dml_affected_rows == 0:
+        raise ValueError("Tree not found")
+    return {"ok": True, "tree_id": tree_id, "deleted_by": str(claims.get("uid") or "")}
+
+
+def _analytics_table_fqn(cfg: BigQueryEnvConfig) -> str:
+    raw = (
+        _env("BQ_ANALYTICS_SOURCE_TABLE")
+        or _env("BQ_QS_SUMMARIES_TABLE")
+        or f"{cfg.project_id}.{cfg.dataset}.{cfg.qs_table_name}"
+    )
+    return raw.replace("`", "").strip()
+
+
+def _analytics_source_sql(cfg: BigQueryEnvConfig) -> str:
+    trees_t = _table_ref(cfg.trees_table_fqn)
+    trees_feat_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.trees_features")
+    qs_t = _table_ref(cfg.qs_table_fqn)
+    qsp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.qs_priority")
+    species_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
+    tqs = cfg.tree_qs_id_column
+    qsid = cfg.qs_join_column
+    return f"""
+    SELECT
+      CAST(COALESCE(s.simple_species, s.common_name, s.full_name, s.scientific_name, 'Unknown') AS STRING) AS top_species,
+      CAST(COALESCE(qs.district, 'Unknown') AS STRING) AS district,
+      CAST(COALESCE(t.status, 'Unknown') AS STRING) AS tree_status,
+      CAST(CASE WHEN COALESCE(t.can_strike_building, FALSE) THEN 'Yes' ELSE 'No' END AS STRING) AS risk_to_building,
+      CAST(
+        CASE
+          WHEN COALESCE(t.maintenance_deficit, 0) >= 12 THEN 'High'
+          WHEN COALESCE(t.maintenance_deficit, 0) >= 6 THEN 'Medium'
+          ELSE 'Low'
+        END AS STRING
+      ) AS maintenance_band,
+      CAST(
+        CASE
+          WHEN CAST(COALESCE(qsp.Priority_Score_Normalized, 0) AS FLOAT64) >= 70 THEN 'Critical'
+          WHEN CAST(COALESCE(qsp.Priority_Score_Normalized, 0) AS FLOAT64) >= 50 THEN 'High'
+          WHEN CAST(COALESCE(qsp.Priority_Score_Normalized, 0) AS FLOAT64) >= 30 THEN 'Medium'
+          ELSE 'Low'
+        END AS STRING
+      ) AS priority_level,
+      CAST(
+        COALESCE(
+          REGEXP_EXTRACT(CAST(t.inventory_date AS STRING), r'(19\\d{{2}}|20\\d{{2}})'),
+          'Unknown'
+        ) AS STRING
+      ) AS inspection_year,
+      CAST(1 AS INT64) AS tree_count,
+      CAST(t.dbh AS FLOAT64) AS avg_dbh,
+      CAST(t.height AS FLOAT64) AS height,
+      CAST(t.age AS FLOAT64) AS age,
+      CAST(t.crown_diameter_m AS FLOAT64) AS crown_diameter_m,
+      CAST(COALESCE(tf.priority_score, 0) AS FLOAT64) AS priority_score,
+      CAST(COALESCE(tf.`I_f`, 0) AS FLOAT64) AS i_f,
+      CAST(COALESCE(tf.`p_f`, 0) AS FLOAT64) AS p_f,
+      CAST(COALESCE(tf.age_term_k3_a_p, 0) AS FLOAT64) AS age_prioritization,
+      CAST(COALESCE(qsp.Priority_Score_Normalized, 0) AS FLOAT64) AS Priority_Score_Normalized
+    FROM {trees_t} t
+    LEFT JOIN {trees_feat_t} tf
+      ON CAST(t.tree_id AS STRING) = CAST(tf.tree_id AS STRING)
+    LEFT JOIN {species_t} s
+      ON t.species_id = s.species_id
+    LEFT JOIN {qs_t} qs
+      ON TRIM(CAST(t.{tqs} AS STRING)) = TRIM(CAST(qs.{qsid} AS STRING))
+    LEFT JOIN {qsp_t} qsp
+      ON TRIM(CAST(t.{tqs} AS STRING)) = TRIM(CAST(qsp.qs_id AS STRING))
+    """
+
+
+@https_fn.on_request(invoker="public")
+def analytics_query(req: https_fn.Request) -> https_fn.Response:
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+    if req.method != "POST":
+        return _json_response(req, {"error": "Method not allowed"}, status=405)
+    if _verify_firebase_user(req) is None:
+        return _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    body = req.get_json(silent=True) or {}
+    draft = body.get("draft")
+    if not isinstance(draft, dict):
+        return _json_response(req, {"error": "Missing draft object"}, status=400)
+    try:
+        from analytics_query.compiler import compile_draft_to_sql
+    except Exception as e:  # noqa: BLE001
+        return _json_response(req, {"error": "Failed loading analytics compiler", "detail": str(e)}, status=500)
+    cfg = bigquery_config_from_environ()
+    try:
+        table_fqn = _analytics_table_fqn(cfg)
+        if "BQ_ANALYTICS_SOURCE_TABLE" in os.environ and _env("BQ_ANALYTICS_SOURCE_TABLE"):
+            sql, param_specs = compile_draft_to_sql(draft, table_fqn=table_fqn)
+        else:
+            placeholder_table = "__analytics_source__"
+            sql_template, param_specs = compile_draft_to_sql(draft, table_fqn=placeholder_table)
+            source_sql = _analytics_source_sql(cfg)
+            sql = sql_template.replace(
+                f"FROM `{placeholder_table}`",
+                f"FROM ({source_sql})",
+            )
+        print(
+            "[analytics_query/firebase] compiled",
+            json.dumps({"table_fqn": table_fqn, "sql_preview": sql[:400], "params": param_specs}, default=str),
+            flush=True,
+        )
+        bq_params: list[bigquery.ScalarQueryParameter] = []
+        for p in param_specs:
+            bq_params.append(bigquery.ScalarQueryParameter(str(p["name"]), str(p["type"]), p.get("value")))
+        client = _bigquery_client(cfg)
+        job = _run_query(
+            client,
+            sql,
+            location=cfg.location,
+            job_config=bigquery.QueryJobConfig(query_parameters=bq_params),
+        )
+        rows: list[dict[str, Any]] = []
+        for r in job.result():
+            out = {
+                "xLabel": str(r["xLabel"] or "Unknown").strip() or "Unknown",
+                "yValue": float(r["yValue"] or 0.0),
+            }
+            if "series" in r:
+                out["series"] = str(r["series"] or "Unknown").strip() or "Unknown"
+            rows.append(out)
+        return _json_response(
+            req,
+            {"rows": rows, "columns": ["xLabel", "yValue"], "source": "bigquery"},
+            status=200,
+        )
+    except ValueError as e:
+        return _json_response(req, {"error": str(e)}, status=400)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("analytics_query failed")
+        return _json_response(req, {"error": "BigQuery error", "message": str(e)}, status=500)
+
+
+@https_fn.on_request(invoker="public")
+def analytics_schema(req: https_fn.Request) -> https_fn.Response:
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+    if req.method != "GET":
+        return _json_response(req, {"error": "Method not allowed"}, status=405)
+    if _verify_firebase_user(req) is None:
+        return _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    try:
+        from analytics_query.compiler import DIMENSION_TO_COLUMN, MEASURE_TO_COLUMN
+
+        dims = [{"id": k, "bqColumn": v, "type": "dimension"} for k, v in sorted(DIMENSION_TO_COLUMN.items())]
+        meas = [{"id": k, "bqColumn": v, "type": "measure"} for k, v in sorted(MEASURE_TO_COLUMN.items())]
+        return _json_response(req, {"dimensions": dims, "measures": meas}, status=200)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("analytics_schema failed")
+        return _json_response(req, {"error": "Failed to load analytics schema", "detail": str(e)}, status=500)
+
+
 @https_fn.on_request()
 def userTasksApi(req: https_fn.Request) -> https_fn.Response:
     """Self-contained user/task CRUD for `users`, `service_requests`, `service_request_assignees`."""
@@ -1333,5 +1816,67 @@ def userTasksApi(req: https_fn.Request) -> https_fn.Response:
         return _json_response(
             req,
             {"error": "Failed processing user tasks request", "detail": str(e), "error_type": type(e).__name__},
+            status=500,
+        )
+
+
+@https_fn.on_request()
+def treesDataApi(req: https_fn.Request) -> https_fn.Response:
+    """Authenticated CRUD for ``trees_core`` (read one tree, list species, create / update / delete)."""
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+    claims = _verify_firebase_user(req)
+    if claims is None:
+        return _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    cfg = bigquery_config_from_environ()
+    client = _bigquery_client(cfg)
+    try:
+        if req.method == "GET":
+            mode = str(_parse_query_param(req, "mode") or "").strip().lower()
+            if mode == "species":
+                lim_raw = _parse_query_param(req, "limit") or "800"
+                try:
+                    lim = int(str(lim_raw))
+                except ValueError:
+                    lim = 800
+                return _json_response(req, _list_species_short_payload(cfg, client, lim), status=200)
+            tree_id_raw = _parse_query_param(req, "tree_id")
+            if not tree_id_raw:
+                return _json_response(
+                    req,
+                    {"error": "Bad request", "message": "Pass tree_id=… or mode=species"},
+                    status=400,
+                )
+            tree_id = _safe_tree_id_param(tree_id_raw)
+            return _json_response(req, {"tree": _get_tree_core_row(cfg, client, tree_id)}, status=200)
+        if req.method != "POST":
+            return _json_response(req, {"error": "Method not allowed"}, status=405)
+        body = req.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip().lower()
+        if action == "create_tree":
+            return _json_response(req, _create_tree_core(body, claims, cfg, client), status=200)
+        if action == "update_tree":
+            return _json_response(req, _update_tree_core(body, claims, cfg, client), status=200)
+        if action == "delete_tree":
+            return _json_response(req, _delete_tree_core(body, claims, cfg, client), status=200)
+        return _json_response(
+            req,
+            {"error": "Bad request", "message": "Unknown action; use create_tree, update_tree, or delete_tree"},
+            status=400,
+        )
+    except ValueError as e:
+        return _json_response(req, {"error": "Bad request", "message": str(e)}, status=400)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("treesDataApi failed")
+        return _json_response(
+            req,
+            {"error": "treesDataApi failed", "detail": str(e), "error_type": type(e).__name__},
             status=500,
         )

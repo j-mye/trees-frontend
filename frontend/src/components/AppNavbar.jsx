@@ -5,7 +5,7 @@ const navInactive = 'font-medium text-slate-500 transition-colors hover:text-ind
 const navActive = 'border-b-2 border-indigo-600 font-semibold text-indigo-700 transition-colors'
 
 /**
- * Global top navigation (Inventory, Analytics, Data Management, Compliance) + profile menu.
+ * Global top navigation (Inventory, Analytics, Data Management, User Tasks) + profile menu.
  * Active link is derived from the current route.
  */
 export default function AppNavbar() {
@@ -37,9 +37,6 @@ export default function AppNavbar() {
           <Link to="/user-tasks" className={onUserTasks ? navActive : navInactive}>
             User Tasks
           </Link>
-          <a className={navInactive} href="#">
-            Compliance
-          </a>
         </div>
       </div>
       <ProfileDropdown

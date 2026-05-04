@@ -6,7 +6,7 @@
  * @typedef {import('./types.js').DraftFilter} DraftFilter
  */
 
-import { CATALOG_DIMENSIONS, CATALOG_MEASURES } from './fieldCatalog.js'
+import { CATALOG_DIMENSIONS, CATALOG_MEASURES, defaultAggregationForMeasureId } from './fieldCatalog.js'
 import { labelForGroupingCell, sanitizeChartRowsForDisplay } from './sanitizeChart.js'
 
 const CATALOG_ALL = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES]
@@ -26,11 +26,6 @@ const CATALOG_ALL = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES]
  * @property {number} [Priority_Score_Normalized]
  */
 
-/**
- * @param {Variable} xAxisItem
- * @param {QuarterSectionFeatureProperties} p
- * @param {number} index
- */
 export function featureDimensionRawLabel(xAxisItem, p, index) {
   if (xAxisItem.id === 'dim-district') return labelForGroupingCell(p.district)
   if (xAxisItem.id === 'dim-priority-level') return labelForGroupingCell(p.priority_level ?? 'Low')
@@ -40,6 +35,8 @@ export function featureDimensionRawLabel(xAxisItem, p, index) {
     if (raw === undefined || raw === null || String(raw).trim() === '') return 'Unknown'
     return String(raw)
   }
+  const key = geoPropertyKeyForFieldId(xAxisItem.id)
+  if (key in p) return labelForGroupingCell(p[key])
   return `Quarter Section ${String(p.qs_id ?? index + 1)}`
 }
 
@@ -64,7 +61,8 @@ function measureSample(yAxisItem, p) {
     const v = Number(p['avg_dbh'])
     return Number.isFinite(v) ? v : NaN
   }
-  const v = Number(p['Priority_Score_Normalized'])
+  const key = geoPropertyKeyForFieldId(yAxisItem.id)
+  const v = Number(p[key])
   return Number.isFinite(v) ? v : NaN
 }
 
@@ -147,6 +145,7 @@ export function buildAggregatedChartRows(xAxisItem, yAxisItem, yAggregation, col
     const feature = features[i]
     const p = /** @type {Record<string, unknown>} */ (feature?.properties ?? {})
     const dimLabel = featureDimensionRawLabel(xAxisItem, /** @type {QuarterSectionFeatureProperties} */ (p), i)
+    if (dimLabel === null) continue
     const seriesLabel = colorItem ? featureSeriesRawLabel(colorItem, p) : ''
     const key = colorItem ? `${dimLabel}\0${seriesLabel}` : dimLabel
 
@@ -156,8 +155,7 @@ export function buildAggregatedChartRows(xAxisItem, yAxisItem, yAggregation, col
       buckets.set(key, b)
     }
     const sample = measureSample(yAxisItem, p)
-    if (yAxisItem.id === 'meas-avg-dbh' && !Number.isFinite(sample)) continue
-    if (yAxisItem.id === 'meas-max-priority' && !Number.isFinite(sample)) continue
+    if (yAxisItem.id !== 'meas-tree-count' && !Number.isFinite(sample)) continue
     b.samples.push(sample)
   }
 
@@ -192,11 +190,15 @@ export function buildAggregatedChartRows(xAxisItem, yAxisItem, yAggregation, col
  * }} opts
  */
 export function executeClientAnalyticsQuery(opts) {
+  let yAggregation = opts.yAggregation
+  if (yAggregation === 'VALUE') {
+    yAggregation = defaultAggregationForMeasureId(opts.yAxisItem.id)
+  }
   const filtered = applyDraftFilters(opts.features, opts.draftFilters)
   const raw = buildAggregatedChartRows(
     opts.xAxisItem,
     opts.yAxisItem,
-    opts.yAggregation,
+    yAggregation,
     opts.colorItem,
     filtered,
   )

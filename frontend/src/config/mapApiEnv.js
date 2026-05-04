@@ -4,6 +4,7 @@
  * Values are injected at build/dev time by Vite from env files in the **frontend**
  * package directory (same folder as `vite.config.js`), e.g. `frontend/.env` and
  * `frontend/.env.local`. Only variables prefixed with `VITE_` are exposed.
+ * Optional: `VITE_CF_TREES_DATA_API_URL` for Data management (`treesDataApi` CRUD on `trees_core`).
  *
  * @see https://vite.dev/guide/env-and-mode.html
  * @see ../../.env.example
@@ -19,4 +20,6 @@ export const mapApiEnv = {
   analyticsSchemaUrl: String(import.meta.env.VITE_CF_ANALYTICS_SCHEMA_URL || '').trim(),
   /** Optional User Tasks endpoint: users + service request assignment CRUD. */
   userTasksUrl: String(import.meta.env.VITE_CF_USER_TASKS_API_URL || '').trim(),
+  /** Optional trees_core CRUD (same Firebase codebase as map summaries; deploy `treesDataApi`). */
+  treesDataUrl: String(import.meta.env.VITE_CF_TREES_DATA_API_URL || '').trim(),
 }

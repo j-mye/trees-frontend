@@ -13,6 +13,7 @@ import { BuilderPane } from '../analytics/panes/BuilderPane.jsx'
 import { CanvasPane } from '../analytics/panes/CanvasPane.jsx'
 import { PantryDragPreview } from '../analytics/components/PantryDragPreview.jsx'
 import { escapeCsvCell } from '../analytics/csvUtils.js'
+import { geoPropertyKeyForFieldId } from '../analytics/clientAggregate.js'
 
 /**
  * @param {'x' | 'y' | 'color' | 'filters'} zone
@@ -20,7 +21,8 @@ import { escapeCsvCell } from '../analytics/csvUtils.js'
  */
 function zoneAcceptsVariable(zone, variable) {
   if (!variable) return false
-  if (zone === 'x' || zone === 'color') return variable.type === 'dimension'
+  if (zone === 'x') return variable.type === 'dimension'
+  if (zone === 'color') return variable.type === 'dimension'
   if (zone === 'y') return variable.type === 'measure'
   if (zone === 'filters') return true
   return false
@@ -30,11 +32,16 @@ export default function AnalyticsPage() {
   const { user, loading: authLoading } = useAuth()
 
   const canvasSectionRef = useRef(/** @type {HTMLElement | null} */ (null))
+  const [infoOpen, setInfoOpen] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const [activePantryVariable, setActivePantryVariable] = useState(
     /** @type {{ id: string, name: string, type: 'dimension' | 'measure' } | null} */ (null),
   )
-  const [lastResult, setLastResult] = useState(/** @type {{ rows: { xLabel: string, yValue: number, series?: string }[]; source: string } | null} */ (null))
+  const [lastResult, setLastResult] = useState(
+    /** @type {{ rows: { xLabel: string, yValue: number, series?: string }[]; source: string; meta?: { rowsReturned: number; chartMaxPoints: number; chartSampled: boolean; chartOriginalCount: number } } | null} */ (
+      null
+    ),
+  )
 
   const dimensions = useAnalyticsDraftStore((s) => s.dimensions)
   const measures = useAnalyticsDraftStore((s) => s.measures)
@@ -92,6 +99,16 @@ export default function AnalyticsPage() {
     migrateLegacyAnalyticsSnapshot(user.uid)
   }, [authLoading, user?.uid])
 
+  useEffect(() => {
+    if (!user?.uid) return
+    console.info('[analytics] env', {
+      uid: user.uid,
+      summariesUrl: mapApiEnv.summariesUrl || null,
+      analyticsQueryUrl: mapApiEnv.analyticsQueryUrl || null,
+      analyticsSchemaUrl: mapApiEnv.analyticsSchemaUrl || null,
+    })
+  }, [user?.uid])
+
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }))
 
   const handleDragStart = useCallback((event) => {
@@ -136,6 +153,46 @@ export default function AnalyticsPage() {
     if (!q) return measures
     return measures.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q))
   }, [measures, searchTerm])
+
+  const colorOptions = useMemo(
+    () => [{ value: '', label: 'None' }, ...dimensions.map((d) => ({ value: d.id, label: d.name }))],
+    [dimensions],
+  )
+
+  const filterValueOptionsByField = useMemo(() => {
+    /** @type {Record<string, string[]>} */
+    const out = {}
+    const feats = featuresQuery.data ?? []
+    for (const v of filterItems) {
+      const key = geoPropertyKeyForFieldId(v.id)
+      /** @type {Map<string, number>} */
+      const counts = new Map()
+      for (const feat of feats) {
+        const p = feat?.properties ?? {}
+        const raw = p && typeof p === 'object' ? p[key] : undefined
+        const str = String(raw ?? '').trim()
+        if (!str) continue
+        counts.set(str, (counts.get(str) ?? 0) + 1)
+      }
+      out[v.id] = [...counts.entries()]
+        .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+        .slice(0, 100)
+        .map(([label]) => label)
+    }
+    return out
+  }, [featuresQuery.data, filterItems])
+
+  const onSelectColorId = useCallback(
+    (id) => {
+      if (!id) {
+        clearColor()
+        return
+      }
+      const next = dimensions.find((d) => d.id === id) ?? null
+      if (next) setColorItem(next)
+    },
+    [clearColor, dimensions, setColorItem],
+  )
 
   const runnable = useMemo(() => isDraftRunnable({ xAxisItem, yAxisItem, yAggregation, colorItem }), [xAxisItem, yAxisItem, yAggregation, colorItem])
 
@@ -220,6 +277,46 @@ export default function AnalyticsPage() {
   return (
     <div className="h-screen w-screen overflow-hidden bg-surface text-on-surface">
       <AppNavbar />
+      {infoOpen ? (
+        <div className="fixed inset-0 z-[12000] flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-2xl rounded-2xl border border-outline-variant/20 bg-surface-container-lowest p-5 shadow-2xl">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-base font-bold text-on-surface">How Analytics Works</h2>
+              <button
+                type="button"
+                aria-label="Close analytics info"
+                className="rounded-md p-1 text-on-surface-variant hover:bg-surface-container-high hover:text-primary"
+                onClick={() => setInfoOpen(false)}
+              >
+                <span className="material-symbols-outlined text-lg">close</span>
+              </button>
+            </div>
+            <div className="space-y-2 text-sm text-on-surface-variant">
+              <p><strong className="text-on-surface">Dimension</strong>: category to group by (for example Species or District).</p>
+              <p><strong className="text-on-surface">Measure</strong>: numeric value to aggregate (for example Tree Count or DBH).</p>
+              <p><strong className="text-on-surface">X-axis</strong>: drag a dimension to group categories (for example Species or District).</p>
+              <p className="text-xs">Large result sets are downsampled in the chart for browser performance (~3.5k points). Export CSV uses the displayed rows.</p>
+              <p><strong className="text-on-surface">Bar</strong>: compares totals/averages across categories.</p>
+              <p><strong className="text-on-surface">Line</strong>: best for trends across ordered categories (like years).</p>
+              <p><strong className="text-on-surface">Pie</strong>: shows composition as parts of a whole.</p>
+              <p><strong className="text-on-surface">Scatter</strong>: compares points to spot clusters and outliers.</p>
+              <p><strong className="text-on-surface">Filters</strong>: drag a field into Filters, then set operator and value to narrow results.</p>
+              <p><strong className="text-on-surface">Color / Legend</strong>: choose a dimension to split one chart into series.</p>
+              <p><strong className="text-on-surface">Histogram</strong>: shows the distribution of the selected measure values.</p>
+              <p className="pt-1 text-xs">Tip: if you see lots of <em>Unknown</em>, add a filter like Species = your target value.</p>
+            </div>
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                className="rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-on-primary hover:opacity-95"
+                onClick={() => setInfoOpen(false)}
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <DndContext
         sensors={sensors}
@@ -252,6 +349,10 @@ export default function AnalyticsPage() {
               onClearY={clearY}
               onClearColor={clearColor}
               onRemoveFilter={removeFilterVariable}
+              colorOptions={colorOptions}
+              selectedColorId={colorItem?.id ?? ''}
+              onSelectColorId={onSelectColorId}
+              filterValueOptionsByField={filterValueOptionsByField}
               canRun={runnable && !featuresQuery.isLoading && Boolean(featuresQuery.data)}
               runBusy={runMutation.isPending}
               onRunQuery={onRunQuery}
@@ -260,12 +361,17 @@ export default function AnalyticsPage() {
               canvasSectionRef={canvasSectionRef}
               hasResult={Boolean(lastResult?.rows?.length)}
               rows={lastResult?.rows ?? []}
+              resultMeta={lastResult?.meta ?? null}
               chartType={chartType}
               onChartType={setChartType}
               allowedChartTypes={allowedCharts}
               chartDisabledReason={reasonForChartType}
               xAxisTitle={xAxisItem?.name ?? ''}
-              yAxisTitle={yAxisItem ? `${yAxisItem.name} (${yAggregation})` : ''}
+              yAxisTitle={
+                yAxisItem
+                  ? `${yAxisItem.name} (${yAggregation})`
+                  : ''
+              }
               loadError={featuresQuery.isError ? loadError : mapApiEnv.summariesUrl ? '' : 'Missing summaries API URL.'}
               runError={runMutation.isError ? String(runMutation.error?.message ?? runMutation.error) : ''}
               onReset={resetGraph}
@@ -274,6 +380,15 @@ export default function AnalyticsPage() {
               exportDisabled={!lastResult?.rows?.length}
             />
           </div>
+          <button
+            type="button"
+            aria-label="Open analytics help"
+            title="How analytics works"
+            className="absolute right-4 top-3 z-[90] flex h-8 w-8 items-center justify-center rounded-full border border-outline-variant/20 bg-surface-container-lowest text-on-surface-variant shadow hover:text-primary"
+            onClick={() => setInfoOpen(true)}
+          >
+            <span className="material-symbols-outlined text-base">info</span>
+          </button>
         </main>
         <DragOverlay dropAnimation={null} className="z-[10000]" style={{ cursor: 'grabbing' }}>
           {activePantryVariable ? <PantryDragPreview variable={activePantryVariable} /> : null}

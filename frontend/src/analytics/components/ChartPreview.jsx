@@ -56,6 +56,83 @@ function formatAxisTick(value) {
   return value.toFixed(2)
 }
 
+/** @param {unknown} xLabel */
+function parseXNumeric(xLabel) {
+  if (xLabel == null) return NaN
+  const n = Number(String(xLabel).replace(/,/g, '').trim())
+  return n
+}
+
+/**
+ * @param {Array<{ xLabel: unknown }>} rows
+ */
+function sortCartesianRows(rows) {
+  if (!rows.length) return rows
+  const allNumericX = rows.every((r) => Number.isFinite(parseXNumeric(r.xLabel)))
+  const out = [...rows]
+  if (allNumericX) {
+    out.sort((a, b) => parseXNumeric(a.xLabel) - parseXNumeric(b.xLabel))
+  } else {
+    out.sort((a, b) => String(a.xLabel).localeCompare(String(b.xLabel)))
+  }
+  return out
+}
+
+/**
+ * Least-squares line y = slope * x + intercept; returns R² on the points used.
+ * @param {Array<{ x: number, y: number }>} points
+ */
+function linearRegression(points) {
+  const n = points.length
+  if (n < 2) return null
+  let sumX = 0
+  let sumY = 0
+  let sumXY = 0
+  let sumXX = 0
+  for (const p of points) {
+    sumX += p.x
+    sumY += p.y
+    sumXY += p.x * p.y
+    sumXX += p.x * p.x
+  }
+  const den = n * sumXX - sumX * sumX
+  if (Math.abs(den) < 1e-15) return null
+  const slope = (n * sumXY - sumX * sumY) / den
+  const intercept = (sumY - slope * sumX) / n
+  const yMean = sumY / n
+  let ssTot = 0
+  let ssRes = 0
+  for (const p of points) {
+    const yhat = slope * p.x + intercept
+    ssRes += (p.y - yhat) ** 2
+    ssTot += (p.y - yMean) ** 2
+  }
+  const r2 = ssTot < 1e-15 ? (ssRes < 1e-15 ? 1 : 0) : 1 - ssRes / ssTot
+  return { slope, intercept, r2 }
+}
+
+/**
+ * @param {Array<{ xLabel: unknown, yValue: number }>} rows
+ */
+function regressionFromXYRows(rows) {
+  /** @type {Array<{ x: number, y: number }>} */
+  const pts = []
+  for (const r of rows) {
+    const x = parseXNumeric(r.xLabel)
+    const y = r.yValue
+    if (Number.isFinite(x) && Number.isFinite(y)) pts.push({ x, y })
+  }
+  return linearRegression(pts)
+}
+
+/** @param {number} n */
+function formatCoeff(n) {
+  if (!Number.isFinite(n)) return '0'
+  const a = Math.abs(n)
+  if (a >= 1e4 || (a > 0 && a < 1e-3)) return n.toExponential(3)
+  return Number.isInteger(n) ? String(n) : n.toFixed(4).replace(/\.?0+$/, '')
+}
+
 /** Human-readable Y series name for tooltips (avoids showing raw `yValue` dataKey). */
 function measureDisplayName(yAxisTitle) {
   const t = String(yAxisTitle ?? '').trim()
@@ -107,7 +184,11 @@ function buildPieData(rows) {
 function prepareCartesianChartData(rows) {
   const hasSeries = rows.some((r) => r.series != null && String(r.series).trim() !== '')
   if (!hasSeries) {
-    return { data: /** @type {Record<string, unknown>[]} */ (rows), seriesKeys: [], isMultiSeries: false }
+    return {
+      data: /** @type {Record<string, unknown>[]} */ (sortCartesianRows(rows)),
+      seriesKeys: [],
+      isMultiSeries: false,
+    }
   }
   /** @type {Set<string>} */
   const seriesSet = new Set()
@@ -131,19 +212,40 @@ function prepareCartesianChartData(rows) {
     const prev = typeof row[s] === 'number' ? row[s] : 0
     row[s] = prev + (Number.isFinite(r.yValue) ? r.yValue : 0)
   }
-  const data = [...byX.values()].sort((a, b) => String(a.xLabel).localeCompare(String(b.xLabel)))
+  const data = sortCartesianRows([...byX.values()])
   return { data, seriesKeys, isMultiSeries: true }
 }
 
 /**
  * @param {object} props
- * @param {'bar' | 'line' | 'pie' | 'scatter'} props.chartType
+ * @param {'bar' | 'line' | 'pie' | 'scatter' | 'histogram'} props.chartType
  * @param {Array<{ xLabel: string, yValue: number, series?: string }>} props.rows
  * @param {string} props.xAxisTitle
  * @param {string} props.yAxisTitle
  */
 export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
   const cartesian = useMemo(() => prepareCartesianChartData(rows), [rows])
+  const lineTrend = useMemo(() => {
+    if (chartType !== 'line') return { data: null, caption: null }
+    const { data, isMultiSeries } = cartesian
+    if (isMultiSeries || data.length < 2) return { data: null, caption: null }
+    const reg = regressionFromXYRows(
+      /** @type {Array<{ xLabel: unknown, yValue: number }>} */ (data),
+    )
+    if (!reg) return { data: null, caption: null }
+    const b = reg.intercept
+    const bPart = b >= 0 ? `+ ${formatCoeff(b)}` : `- ${formatCoeff(Math.abs(b))}`
+    const caption = {
+      equation: `y = ${formatCoeff(reg.slope)}x ${bPart}`,
+      r2: reg.r2.toFixed(4),
+    }
+    const withTrend = data.map((r) => {
+      const xv = parseXNumeric(r.xLabel)
+      const yhat = Number.isFinite(xv) ? reg.slope * xv + reg.intercept : NaN
+      return { ...r, trendY: Number.isFinite(yhat) ? yhat : undefined }
+    })
+    return { data: withTrend, caption }
+  }, [chartType, cartesian])
 
   if (!rows.length) return null
 
@@ -237,8 +339,53 @@ export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
     )
   }
 
+  if (chartType === 'histogram') {
+    const values = rows.map((r) => Number(r.yValue)).filter((v) => Number.isFinite(v))
+    if (!values.length) return null
+    const min = Math.min(...values)
+    const max = Math.max(...values)
+    const bins = Math.min(14, Math.max(6, Math.round(Math.sqrt(values.length))))
+    const width = max > min ? (max - min) / bins : 1
+    const hist = Array.from({ length: bins }, (_, i) => {
+      const lo = min + i * width
+      const hi = i === bins - 1 ? max : lo + width
+      return { xLabel: `${lo.toFixed(1)}-${hi.toFixed(1)}`, yValue: 0 }
+    })
+    for (const v of values) {
+      const idx = max > min ? Math.min(bins - 1, Math.floor((v - min) / width)) : 0
+      hist[idx].yValue += 1
+    }
+    const xLabel = measureName
+    return (
+      <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
+        <ResponsiveContainer width="100%" height="100%" className="h-full min-h-0 min-w-0 w-full">
+          <BarChart data={hist} margin={chartAxisMarginLeftLabeled}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e3e9ec" />
+            <XAxis
+              dataKey="xLabel"
+              tick={{ fontSize: 10 }}
+              stroke="#737c7f"
+              label={{ value: xLabel, position: 'insideBottom', offset: -18, ...AXIS_TITLE_LABEL_STYLE }}
+            />
+            <YAxis
+              tick={{ fontSize: 11 }}
+              width={yAxisTickWidth}
+              stroke="#737c7f"
+              allowDecimals={false}
+              label={yAxisTitleLabelProps('Frequency')}
+            />
+            <Tooltip formatter={(v) => [v, 'Count']} separator=": " />
+            <Bar dataKey="yValue" fill={CHART_STROKE} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    )
+  }
+
   if (chartType === 'line') {
-    const { data, seriesKeys, isMultiSeries } = cartesian
+    const { seriesKeys, isMultiSeries } = cartesian
+    const data = lineTrend.data ?? cartesian.data
+    const trendCaption = !isMultiSeries ? lineTrend.caption : null
     const showLegend = isMultiSeries
     const margin = barLineChartMargin(showLegend)
     const xDimTitleProp = buildXAxisDimensionTitleProps(xAxisTitle, showLegend)
@@ -281,8 +428,29 @@ export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
             : (
                 <Line type="monotone" dataKey="yValue" stroke={CHART_STROKE} strokeWidth={2} dot={{ r: 3, fill: CHART_STROKE }} />
               )}
+          {!isMultiSeries && lineTrend.data ? (
+            <Line
+              type="linear"
+              dataKey="trendY"
+              name="Least squares"
+              stroke="#c62828"
+              strokeWidth={2}
+              strokeDasharray="6 4"
+              dot={false}
+              isAnimationActive={false}
+              connectNulls
+            />
+          ) : null}
         </LineChart>
         </ResponsiveContainer>
+        {trendCaption ? (
+          <div className="mt-2 shrink-0 space-y-0.5 px-2 text-center text-[11px] leading-snug text-slate-600">
+            <div className="font-mono tabular-nums">{trendCaption.equation}</div>
+            <div>
+              R<sup>2</sup> = {trendCaption.r2}
+            </div>
+          </div>
+        ) : null}
       </div>
     )
   }

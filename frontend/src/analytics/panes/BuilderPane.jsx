@@ -1,5 +1,5 @@
 import { useDroppable } from '@dnd-kit/core'
-import { useState } from 'react'
+import { useId } from 'react'
 import { StyledListbox } from '../components/StyledListbox.jsx'
 import { AGGREGATIONS } from '../types.js'
 import { CATALOG_DIMENSIONS, CATALOG_MEASURES } from '../fieldCatalog.js'
@@ -12,7 +12,7 @@ const NUMERIC_FILTER_OPTIONS = [
   { value: 'lte', label: '<=' },
 ]
 
-const CATEGORICAL_FILTER_OPTIONS = [{ value: 'eq', label: 'equals' }]
+const CATEGORICAL_FILTER_OPTIONS = [{ value: 'eq', label: '=' }]
 
 const scrollPane =
   'flex-1 min-h-0 overflow-y-auto [scrollbar-width:thin] [scrollbar-color:theme(colors.surface.dim)_transparent] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-[10px] [&::-webkit-scrollbar-thumb]:bg-surface-dim'
@@ -56,19 +56,18 @@ function isNumericCatalogField(fieldId) {
  * @param {object} props
  * @param {{ id: string, name: string, type: string }} props.variable
  * @param {import('../types.js').DraftFilter | undefined} props.filter
+ * @param {string[]} props.valueOptions
  * @param {(patch: object) => void} props.onChange
  * @param {() => void} props.onRemove
  */
-function FilterRow({ variable, filter, onChange, onRemove }) {
-  const [open, setOpen] = useState(false)
+function FilterRow({ variable, filter, valueOptions, onChange, onRemove }) {
+  const datalistId = useId()
   const numeric = isNumericCatalogField(variable.id)
   const f = filter ?? { fieldId: variable.id, op: numeric ? 'gte' : 'eq', value: '' }
   return (
-    <div className="relative flex w-full flex-col gap-1 rounded-lg bg-surface-container-high px-2 py-1">
-      <div className="flex items-center justify-between gap-2">
-        <button type="button" className="min-w-0 flex-1 truncate text-left text-xs font-medium text-on-surface" onClick={() => setOpen((o) => !o)}>
-          {variable.name}
-        </button>
+    <div className="relative flex w-full flex-col gap-1 rounded-lg bg-surface-container-high px-2 py-2">
+      <div className="flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-wide text-on-surface-variant">
+        <span className="truncate">{variable.name}</span>
         <button
           type="button"
           aria-label={`Remove ${variable.name}`}
@@ -78,31 +77,32 @@ function FilterRow({ variable, filter, onChange, onRemove }) {
           <span className="material-symbols-outlined text-sm leading-none">close</span>
         </button>
       </div>
-      {open ? (
-        <div className="flex flex-col gap-1 border-t border-outline-variant/20 pt-1">
-          {numeric ? (
-            <StyledListbox
-              className="w-full"
-              value={f.op}
-              options={NUMERIC_FILTER_OPTIONS}
-              onChange={(v) => onChange({ op: /** @type {import('../types.js').FilterOp} */ (v) })}
-            />
-          ) : (
-            <StyledListbox
-              className="w-full"
-              value={f.op}
-              options={CATEGORICAL_FILTER_OPTIONS}
-              onChange={(v) => onChange({ op: /** @type {import('../types.js').FilterOp} */ (v) })}
-            />
-          )}
+      <div className="grid grid-cols-[88px_minmax(0,1fr)] items-center gap-1 border-t border-outline-variant/20 pt-2">
+        <span className="text-[10px] text-on-surface-variant">Operator</span>
+        <StyledListbox
+          className="w-full"
+          value={f.op}
+          options={numeric ? NUMERIC_FILTER_OPTIONS : CATEGORICAL_FILTER_OPTIONS}
+          onChange={(v) => onChange({ op: /** @type {import('../types.js').FilterOp} */ (v) })}
+        />
+        <span className="text-[10px] text-on-surface-variant">Value</span>
+        <div>
           <input
-            className="rounded border border-outline-variant/30 bg-surface-container-lowest px-1 py-0.5 text-[10px]"
-            placeholder={numeric ? 'Number' : 'Text'}
+            className="w-full rounded border border-outline-variant/30 bg-surface-container-lowest px-1 py-1 text-[10px]"
+            placeholder={numeric ? 'Enter number' : 'Select or type value'}
             value={f.value}
+            list={valueOptions.length ? datalistId : undefined}
             onChange={(e) => onChange({ value: e.target.value })}
           />
+          {valueOptions.length ? (
+            <datalist id={datalistId}>
+              {valueOptions.map((v) => (
+                <option key={v} value={v} />
+              ))}
+            </datalist>
+          ) : null}
         </div>
-      ) : null}
+      </div>
     </div>
   )
 }
@@ -122,6 +122,10 @@ function FilterRow({ variable, filter, onChange, onRemove }) {
  * @param {() => void} props.onClearY
  * @param {() => void} props.onClearColor
  * @param {(id: string) => void} props.onRemoveFilter
+ * @param {{ value: string, label: string }[]} props.colorOptions
+ * @param {string} props.selectedColorId
+ * @param {(id: string) => void} props.onSelectColorId
+ * @param {Record<string, string[]>} props.filterValueOptionsByField
  * @param {boolean} props.canRun
  * @param {boolean} props.runBusy
  * @param {() => void} props.onRunQuery
@@ -140,10 +144,16 @@ export function BuilderPane({
   onClearY,
   onClearColor,
   onRemoveFilter,
+  colorOptions,
+  selectedColorId,
+  onSelectColorId,
+  filterValueOptionsByField,
   canRun,
   runBusy,
   onRunQuery,
 }) {
+  const yAggregationOptions = AGGREGATIONS.map((a) => ({ value: a, label: a }))
+
   const dropPlaceholder = (icon, text) => (
     <>
       <span className="material-symbols-outlined text-2xl text-outline">{icon}</span>
@@ -151,7 +161,12 @@ export function BuilderPane({
     </>
   )
 
-  const filledChip = (variable, onClear) => (
+  /**
+   * @param {{ id: string, name: string, type: 'dimension' | 'measure' }} variable
+   * @param {() => void} onClear
+   * @param {boolean} showAggregation
+   */
+  const filledChip = (variable, onClear, showAggregation) => (
     <div className="flex w-full flex-col gap-1 px-3 py-2">
       <div className="flex w-full items-center justify-between gap-2">
         <span
@@ -168,13 +183,13 @@ export function BuilderPane({
           <span className="material-symbols-outlined text-base leading-none">close</span>
         </button>
       </div>
-      {variable.type === 'measure' ? (
+      {showAggregation && variable.type === 'measure' ? (
         <div className="flex min-w-0 flex-1 items-center gap-1 text-[10px] text-on-surface-variant">
           <span className="shrink-0 font-bold uppercase">Agg</span>
           <StyledListbox
             className="min-w-0 flex-1"
             value={yAggregation}
-            options={AGGREGATIONS.map((a) => ({ value: a, label: a }))}
+            options={yAggregationOptions}
             onChange={(v) => onYAggregation(/** @type {import('../types.js').Aggregation} */ (v))}
           />
         </div>
@@ -196,7 +211,7 @@ export function BuilderPane({
             isActiveDrag={dragActive}
             isEmpty={!xAxisItem}
             placeholder={dropPlaceholder('add_circle', 'Drop a Dimension')}
-            filled={xAxisItem ? filledChip(xAxisItem, onClearX) : null}
+            filled={xAxisItem ? filledChip(xAxisItem, onClearX, false) : null}
           />
         </div>
         <div className="space-y-2">
@@ -207,18 +222,7 @@ export function BuilderPane({
             isActiveDrag={dragActive}
             isEmpty={!yAxisItem}
             placeholder={dropPlaceholder('add_circle', 'Drop a Measure')}
-            filled={yAxisItem ? filledChip(yAxisItem, onClearY) : null}
-          />
-        </div>
-        <div className="space-y-2">
-          <label className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">Color / Legend</label>
-          <DroppableZone
-            zoneId="color"
-            minHeightClass="h-24"
-            isActiveDrag={dragActive}
-            isEmpty={!colorItem}
-            placeholder={dropPlaceholder('palette', 'Drop a Dimension')}
-            filled={colorItem ? filledChip(colorItem, onClearColor) : null}
+            filled={yAxisItem ? filledChip(yAxisItem, onClearY, true) : null}
           />
         </div>
         <div className="space-y-2">
@@ -236,6 +240,7 @@ export function BuilderPane({
                     key={v.id}
                     variable={v}
                     filter={draftFilters.find((f) => f.fieldId === v.id)}
+                    valueOptions={filterValueOptionsByField[v.id] ?? []}
                     onChange={(patch) => onUpdateDraftFilter(v.id, patch)}
                     onRemove={() => onRemoveFilter(v.id)}
                   />
@@ -245,7 +250,16 @@ export function BuilderPane({
           />
         </div>
       </div>
-      <div className="mt-auto p-6">
+      <div className="mt-auto space-y-3 p-6">
+        <div className="space-y-1">
+          <label className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant">Color / Legend</label>
+          <StyledListbox className="w-full" value={selectedColorId} options={colorOptions} onChange={onSelectColorId} />
+          {colorItem ? (
+            <button type="button" className="text-[10px] text-primary hover:underline" onClick={onClearColor}>
+              Clear color
+            </button>
+          ) : null}
+        </div>
         <button
           type="button"
           disabled={!canRun || runBusy}

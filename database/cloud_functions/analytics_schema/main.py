@@ -6,18 +6,7 @@ import functions_framework
 from firebase_auth import require_firebase_auth
 from flask import Request, jsonify
 
-# Keep in sync with database/cloud_functions/analytics_query/compiler.py
-DIMENSION_TO_COLUMN = {
-    "dim-species": "top_species",
-    "dim-district": "district",
-    "dim-priority-level": "priority_level",
-    "dim-inspection-year": "inspection_year",
-}
-MEASURE_TO_COLUMN = {
-    "meas-tree-count": "tree_count",
-    "meas-avg-dbh": "avg_dbh",
-    "meas-max-priority": "Priority_Score_Normalized",
-}
+from analytics_query.compiler import DIMENSION_TO_COLUMN, MEASURE_TO_COLUMN
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
