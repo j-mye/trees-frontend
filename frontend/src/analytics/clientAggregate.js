@@ -6,10 +6,19 @@
  * @typedef {import('./types.js').DraftFilter} DraftFilter
  */
 
-import { CATALOG_DIMENSIONS, CATALOG_MEASURES, defaultAggregationForMeasureId } from './fieldCatalog.js'
+import {
+  CATALOG_DIMENSIONS,
+  CATALOG_FILTERS,
+  CATALOG_MEASURES,
+  catalogColumnForFieldId,
+  defaultAggregationForMeasureId,
+} from './fieldCatalog.js'
+import { FILTER_QUARTER_SECTION_ID } from './fieldCatalog.js'
+import { parseInFilterValues } from './filterUtils.js'
+import { quarterSectionIdFromProperties } from './quarterSectionId.js'
 import { labelForGroupingCell, sanitizeChartRowsForDisplay } from './sanitizeChart.js'
 
-const CATALOG_ALL = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES]
+const CATALOG_ALL = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES, ...CATALOG_FILTERS]
 
 /* Never build BigQuery SQL in the browser; server compiler only (see database/cloud_functions/analytics_query). */
 
@@ -27,9 +36,13 @@ const CATALOG_ALL = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES]
  */
 
 export function featureDimensionRawLabel(xAxisItem, p, index) {
-  if (xAxisItem.id === 'dim-district') return labelForGroupingCell(p.district)
+  if (xAxisItem.id === 'dim-quarter-section') {
+    const id = quarterSectionIdFromProperties(p)
+    return id ? labelForGroupingCell(id) : `QS-${index + 1}`
+  }
   if (xAxisItem.id === 'dim-priority-level') return labelForGroupingCell(p.priority_level ?? 'Low')
   if (xAxisItem.id === 'dim-species') return labelForGroupingCell(p.top_species)
+  if (xAxisItem.id === 'dim-district') return labelForGroupingCell(p.district)
   if (xAxisItem.id === 'dim-inspection-year') {
     const raw = p.inspection_year
     if (raw === undefined || raw === null || String(raw).trim() === '') return 'Unknown'
@@ -37,7 +50,7 @@ export function featureDimensionRawLabel(xAxisItem, p, index) {
   }
   const key = geoPropertyKeyForFieldId(xAxisItem.id)
   if (key in p) return labelForGroupingCell(p[key])
-  return `Quarter Section ${String(p.qs_id ?? index + 1)}`
+  return 'Unknown'
 }
 
 /**
@@ -83,21 +96,33 @@ function reduceAgg(values, agg) {
  * @param {string} fieldId
  */
 export function geoPropertyKeyForFieldId(fieldId) {
-  const c = CATALOG_ALL.find((x) => x.id === fieldId)
-  return c?.bqColumn ?? fieldId
+  return catalogColumnForFieldId(fieldId)
 }
 
 /**
  * @param {Record<string, unknown>} p
  * @param {DraftFilter} f
  */
-function rowMatchesFilter(p, f) {
-  const key = geoPropertyKeyForFieldId(f.fieldId)
-  const raw = p[key]
+function filterPropertyString(p, fieldId) {
+  if (fieldId === FILTER_QUARTER_SECTION_ID || fieldId === 'dim-quarter-section') {
+    return quarterSectionIdFromProperties(p)
+  }
+  const key = geoPropertyKeyForFieldId(fieldId)
+  return String(p[key] ?? '').trim()
+}
+
+function rowMatchesFilter(p, f, allFilters) {
+  const str = filterPropertyString(p, f.fieldId)
+  const raw = p[geoPropertyKeyForFieldId(f.fieldId)]
   const cell = Number(raw)
   const num = Number.isFinite(cell) && raw !== '' && raw != null ? cell : NaN
-  const str = String(raw ?? '').trim()
   const v = Number(f.value)
+  if (f.op === 'in') {
+    const allowed = parseInFilterValues(allFilters, f.fieldId)
+    if (!allowed.length) return true
+    const allowedSet = new Set(allowed.map((a) => String(a).trim()).filter(Boolean))
+    return allowedSet.has(str)
+  }
   switch (f.op) {
     case 'eq':
       if (!Number.isNaN(num) && Number.isFinite(v) && f.value !== '') return num === v
@@ -123,7 +148,7 @@ export function applyDraftFilters(features, filters) {
   if (!filters.length) return features
   return features.filter((feat) => {
     const p = /** @type {Record<string, unknown>} */ (feat?.properties ?? {})
-    return filters.every((f) => rowMatchesFilter(p, f))
+    return filters.every((f) => rowMatchesFilter(p, f, filters))
   })
 }
 
@@ -195,6 +220,20 @@ export function executeClientAnalyticsQuery(opts) {
     yAggregation = defaultAggregationForMeasureId(opts.yAxisItem.id)
   }
   const filtered = applyDraftFilters(opts.features, opts.draftFilters)
+
+  if (opts.draftFilters.length > 0) {
+    console.info('[analytics] filter applied', {
+      totalFeatures: opts.features.length,
+      filteredFeatures: filtered.length,
+      filters: opts.draftFilters.map((f) => ({
+        fieldId: f.fieldId,
+        op: f.op,
+        values: f.values ?? f.value,
+      })),
+      sampleFilteredQsIds: filtered.slice(0, 5).map((feat) => feat?.properties?.qs_id),
+    })
+  }
+
   const raw = buildAggregatedChartRows(
     opts.xAxisItem,
     opts.yAxisItem,
@@ -202,5 +241,14 @@ export function executeClientAnalyticsQuery(opts) {
     opts.colorItem,
     filtered,
   )
+
+  if (raw.length === 0 && filtered.length > 0) {
+    console.warn('[analytics] aggregation produced 0 rows from', filtered.length, 'features — check measure key / dimension fallback')
+  } else if (raw.length > 0 && raw.every((r) => r.yValue === 0) && filtered.length > 0) {
+    const measureKey = geoPropertyKeyForFieldId(opts.yAxisItem.id)
+    const sampleProps = filtered[0]?.properties ?? {}
+    console.warn('[analytics] all aggregated values are 0 — measure key:', measureKey, '— exists in sample feature?', measureKey in sampleProps)
+  }
+
   return sanitizeChartRowsForDisplay(raw)
 }

@@ -220,10 +220,11 @@ function prepareCartesianChartData(rows) {
  * @param {object} props
  * @param {'bar' | 'line' | 'pie' | 'scatter' | 'histogram'} props.chartType
  * @param {Array<{ xLabel: string, yValue: number, series?: string }>} props.rows
+ * @param {string} [props.chartTitle]
  * @param {string} props.xAxisTitle
  * @param {string} props.yAxisTitle
  */
-export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
+export function ChartPreview({ chartType, rows, chartTitle = '', xAxisTitle, yAxisTitle }) {
   const cartesian = useMemo(() => prepareCartesianChartData(rows), [rows])
   const lineTrend = useMemo(() => {
     if (chartType !== 'line') return { data: null, caption: null }
@@ -255,10 +256,15 @@ export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
   if (chartType === 'pie') {
     const pieData = buildPieData(rows).map((d) => ({ name: d.name, value: Number(d.value) }))
     const caption =
-      xAxisTitle && yAxisTitle ? `${xAxisTitle} · ${yAxisTitle}` : xAxisTitle || yAxisTitle || 'Distribution'
+      chartTitle ||
+      (xAxisTitle && yAxisTitle ? `${xAxisTitle} · ${yAxisTitle}` : xAxisTitle || yAxisTitle || 'Distribution')
     return (
       <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
-        <p className="mb-1 shrink-0 truncate px-1 text-center text-[11px] font-bold text-on-surface-variant">{caption}</p>
+        {!chartTitle ? (
+          <p className="mb-1 shrink-0 truncate px-1 text-center text-[11px] font-bold text-on-surface-variant">
+            {caption}
+          </p>
+        ) : null}
         <div className="min-h-0 min-w-0 flex-1">
           {pieData.length === 0 ? (
             <div className="flex h-[260px] items-center justify-center px-4 text-center text-sm text-on-surface-variant">
@@ -488,7 +494,7 @@ export function ChartPreview({ chartType, rows, xAxisTitle, yAxisTitle }) {
               <Bar key={key} dataKey={key} fill={SERIES_COLORS[i % SERIES_COLORS.length]} radius={[4, 4, 0, 0]} isAnimationActive={false} />
             ))
           : (
-              <Bar dataKey="yValue" fill={CHART_STROKE} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="yValue" fill={CHART_STROKE} radius={[4, 4, 0, 0]} isAnimationActive={false} minPointSize={2} />
             )}
       </BarChart>
       </ResponsiveContainer>

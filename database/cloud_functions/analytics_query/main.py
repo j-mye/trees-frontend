@@ -124,15 +124,15 @@ def analytics_query(request: Request):
 
     try:
         client = bigquery.Client()
-        bq_params: list[bigquery.ScalarQueryParameter] = []
+        bq_params: list[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter] = []
         for p in param_specs:
-            bq_params.append(
-                bigquery.ScalarQueryParameter(
-                    str(p["name"]),
-                    str(p["type"]),
-                    p.get("value"),
-                )
-            )
+            p_name = str(p["name"])
+            p_type = str(p["type"])
+            p_value = p.get("value")
+            if p_type == "ARRAY<STRING>":
+                bq_params.append(bigquery.ArrayQueryParameter(p_name, "STRING", list(p_value or [])))
+            else:
+                bq_params.append(bigquery.ScalarQueryParameter(p_name, p_type, p_value))
         job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=bq_params))
         rows_out: list[dict[str, Any]] = []
         for r in job.result():

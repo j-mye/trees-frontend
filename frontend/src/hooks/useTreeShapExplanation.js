@@ -5,9 +5,9 @@ import { getFirebaseAuth } from '../firebase.js'
  * Fetch SHAP English explanation for a tree/site id from getTreeShapExplanation.
  *
  * @param {object} options
- * @param {string | null | undefined} options.siteId Tree key (e.g. tree_id); query disabled when falsy.
+ * @param {string | null | undefined} options.siteId Municipal Site ID for SHAP lookup (not tree_row_id).
  * @param {string} options.shapExplanationUrl Full Cloud Function URL (VITE_CF_GET_TREE_SHAP_EXPLANATION_URL).
- * @returns {import('@tanstack/react-query').UseQueryResult<string | null, Error>}
+ * @returns {import('@tanstack/react-query').UseQueryResult<{ englishTranslation: string | null, contributions: { feature: string, value: number }[] } | null, Error>}
  */
 export function useTreeShapExplanation({ siteId, shapExplanationUrl }) {
   const url = String(shapExplanationUrl || '').trim()
@@ -43,9 +43,23 @@ export function useTreeShapExplanation({ siteId, shapExplanationUrl }) {
         throw new Error(msg)
       }
       const raw = json?.english_translation
-      if (raw == null) return null
-      const s = String(raw).trim()
-      return s.length ? s : null
+      const englishTranslation =
+        raw == null ? null : (() => {
+          const s = String(raw).trim()
+          return s.length ? s : null
+        })()
+      const contributions = Array.isArray(json?.contributions)
+        ? json.contributions
+            .map((row) => {
+              if (!row || typeof row !== 'object') return null
+              const feature = row.feature != null ? String(row.feature) : String(row.name ?? '')
+              const value = Number(row.value)
+              if (!feature.trim() || !Number.isFinite(value)) return null
+              return { feature: feature.trim(), value }
+            })
+            .filter(Boolean)
+        : []
+      return { englishTranslation, contributions }
     },
   })
 }

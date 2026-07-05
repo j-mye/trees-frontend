@@ -1,24 +1,67 @@
 import { useEffect, useState } from 'react'
-import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import PostLoginRedirect from '../components/PostLoginRedirect.jsx'
+import { LoginInfoModal } from '../components/login/LoginInfoModal.jsx'
+import {
+  LOGIN_LEGAL_LAST_UPDATED,
+  LoginForgotPasswordContent,
+  LoginHelpContent,
+  LoginPrivacyPolicyContent,
+  LoginSecurityTermsContent,
+} from '../content/loginLegalCopy.jsx'
+import { useAccess } from '../contexts/AccessContext.jsx'
 import { useAuth } from '../contexts/AuthContext.jsx'
 
-const DEFAULT_LOGIN_REDIRECT = '/dashboard.html'
+const DEFAULT_LOGIN_REDIRECT = '/dashboard'
+
+/** @typedef {'privacy' | 'security' | 'help' | 'forgot-password'} LoginInfoModalKey */
+
+const LOGIN_INFO_MODALS = /** @type {const} */ ({
+  privacy: {
+    title: 'Privacy Policy',
+    Content: LoginPrivacyPolicyContent,
+  },
+  security: {
+    title: 'Security & Terms of Use',
+    Content: LoginSecurityTermsContent,
+  },
+  help: {
+    title: 'Help & Support',
+    Content: LoginHelpContent,
+  },
+  'forgot-password': {
+    title: 'Password reset unavailable',
+    Content: LoginForgotPasswordContent,
+  },
+})
+
+/** Map legacy static paths to React Router routes after sign-in. */
+function normalizeLoginRedirect(path) {
+  if (path === '/dashboard.html') return '/dashboard'
+  return path
+}
 
 function isStaticHtmlPath(path) {
   return typeof path === 'string' && path.endsWith('.html')
 }
 
 export default function LoginPage() {
-  const { user, loading, firebaseConfigured, login, signup, sendPasswordReset } = useAuth()
+  const { user, loading, firebaseConfigured, login, signup } = useAuth()
+  const { submitRegistration, accessApiConfigured, approvalRequired } = useAccess()
   const location = useLocation()
   const navigate = useNavigate()
+  const [formMode, setFormMode] = useState('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [organization, setOrganization] = useState('')
+  const [accessNote, setAccessNote] = useState('')
   const [rememberMe, setRememberMe] = useState(true)
   const [err, setErr] = useState(null)
   const [pending, setPending] = useState(null)
+  const [infoModal, setInfoModal] = useState(/** @type {LoginInfoModalKey | null} */ (null))
 
-  const from = location.state?.from || DEFAULT_LOGIN_REDIRECT
+  const from = normalizeLoginRedirect(location.state?.from || DEFAULT_LOGIN_REDIRECT)
 
   useEffect(() => {
     if (!user || !isStaticHtmlPath(from)) return
@@ -37,10 +80,10 @@ export default function LoginPage() {
               values from the Firebase console.
             </p>
             <p className="ds-body-md mt-6 text-on-surface-variant">
-              You can still use the static dashboard at{' '}
-              <a className="font-semibold text-primary hover:text-primary-dim" href="/dashboard.html">
-                /dashboard.html
-              </a>
+              Configure Firebase to use the app at{' '}
+              <Link className="font-semibold text-primary hover:text-primary-dim" to="/dashboard">
+                /dashboard
+              </Link>
               .
             </p>
             <Link
@@ -71,7 +114,7 @@ export default function LoginPage() {
         </div>
       )
     }
-    return <Navigate to={from} replace />
+    return <PostLoginRedirect from={from} />
   }
 
   function redirectAfterAuth(dest) {
@@ -100,11 +143,24 @@ export default function LoginPage() {
 
   async function onSignUp(e) {
     e.preventDefault()
+    if (!displayName.trim() || !organization.trim() || !accessNote.trim()) {
+      setErr('Name, organization, and reason for access are required.')
+      return
+    }
     setErr(null)
     setPending('signup')
     try {
       await signup(email, password, rememberMe)
-      redirectAfterAuth(from)
+      if (accessApiConfigured && approvalRequired) {
+        await submitRegistration({
+          display_name: displayName.trim(),
+          organization: organization.trim(),
+          access_note: accessNote.trim(),
+        })
+        navigate('/pending-approval', { replace: true })
+      } else {
+        redirectAfterAuth(from)
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -112,35 +168,38 @@ export default function LoginPage() {
     }
   }
 
-  async function onForgotPassword(e) {
+  const isSignup = formMode === 'signup'
+  const activeInfoModal = infoModal ? LOGIN_INFO_MODALS[infoModal] : null
+  const InfoModalContent = activeInfoModal?.Content ?? null
+
+  function openInfoModal(key) {
+    setInfoModal(key)
+  }
+
+  function onForgotPasswordClick(e) {
     e.preventDefault()
-    if (!email.trim()) {
-      setErr('Enter your email address above, then try Forgot Password again.')
-      return
-    }
-    setErr(null)
-    setPending('reset')
-    try {
-      await sendPasswordReset(email)
-      alert('If an account exists for that email, a reset link has been sent.')
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e))
-    } finally {
-      setPending(null)
-    }
+    openInfoModal('forgot-password')
   }
 
   return (
     <div
-      className="bg-surface font-body text-on-surface min-h-screen flex items-center justify-center p-6 auth-bg"
+      className="auth-bg flex min-h-[100dvh] justify-center overflow-y-auto bg-surface p-4 font-body text-on-surface sm:p-6"
       data-location="Milwaukee"
     >
-      <main className="w-full max-w-md">
+      <main
+        className={`my-auto w-full shrink-0 ${isSignup ? 'max-w-2xl' : 'max-w-md'}`}
+      >
         {/* Central Login Card */}
-        <div className="glass-panel border-none rounded-[1.5rem] shadow-2xl p-8 md:p-10 flex flex-col gap-8">
+        <div
+          className={`glass-panel flex flex-col rounded-[1.5rem] border-none shadow-2xl ${
+            isSignup ? 'gap-5 p-6 md:gap-6 md:p-8' : 'gap-8 p-8 md:p-10'
+          }`}
+        >
 
           {/* Branding Header */}
-          <div className="flex flex-col items-center text-center gap-4">
+          <div
+            className={`flex flex-col items-center text-center ${isSignup ? 'gap-2' : 'gap-4'}`}
+          >
             <div className="bg-purple-600 p-3 rounded-xl shadow-lg shadow-purple-600/30">
               <span className="material-symbols-outlined text-white text-3xl" data-icon="nature">
                 nature
@@ -155,19 +214,43 @@ export default function LoginPage() {
           </div>
 
           {/* Form Heading */}
-          <div className="space-y-1">
-            <h2 className="text-2xl font-bold tracking-tight text-gray-800">Sign In</h2>
-            <p className="text-sm text-on-surface-variant leading-relaxed">
-              Enter your municipal credentials to access the ledger.
+          <div className="space-y-3">
+            <div className="flex rounded-xl bg-surface-container-high p-1">
+              <button
+                type="button"
+                className={`flex-1 rounded-lg py-2 text-sm font-semibold transition-colors ${formMode === 'login' ? 'bg-white text-indigo-700 shadow-sm' : 'text-on-surface-variant'}`}
+                onClick={() => setFormMode('login')}
+                disabled={busy}
+              >
+                Sign in
+              </button>
+              <button
+                type="button"
+                className={`flex-1 rounded-lg py-2 text-sm font-semibold transition-colors ${formMode === 'signup' ? 'bg-white text-indigo-700 shadow-sm' : 'text-on-surface-variant'}`}
+                onClick={() => setFormMode('signup')}
+                disabled={busy}
+              >
+                Request access
+              </button>
+            </div>
+            <h2 className={`font-bold tracking-tight text-gray-800 ${isSignup ? 'text-xl' : 'text-2xl'}`}>
+              {formMode === 'login' ? 'Sign In' : 'Request portal access'}
+            </h2>
+            <p
+              className={`text-on-surface-variant leading-relaxed ${isSignup ? 'text-xs sm:text-sm' : 'text-sm'}`}
+            >
+              {formMode === 'login'
+                ? 'Enter your municipal credentials to access the ledger.'
+                : 'Create credentials and submit a request. An administrator must approve your account before you can use the portal.'}
             </p>
           </div>
 
           {/* Login Form */}
-          <form className="flex flex-col gap-5" onSubmit={onSubmit}>
-            <div className="space-y-4">
+          <form className={`flex flex-col ${isSignup ? 'gap-4' : 'gap-5'}`} onSubmit={onSubmit}>
+            <div className={isSignup ? 'grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4' : 'space-y-4'}>
 
               {/* Email Field */}
-              <div className="space-y-1.5">
+              <div className={`space-y-1.5 ${isSignup ? 'sm:col-span-1' : ''}`}>
                 <label className="text-xs font-semibold text-on-surface-variant ml-1" htmlFor="email">
                   Email Address
                 </label>
@@ -178,7 +261,7 @@ export default function LoginPage() {
                     </span>
                   </div>
                   <input
-                    className="block w-full pl-11 pr-4 py-3 bg-surface-container-high border-none rounded-xl text-on-surface placeholder:text-outline/60 focus:ring-0 focus:bg-white transition-all duration-200"
+                    className={`block w-full rounded-xl border-none bg-surface-container-high pl-11 pr-4 text-on-surface transition-all duration-200 placeholder:text-outline/60 focus:bg-white focus:ring-0 ${isSignup ? 'py-2.5' : 'py-3'}`}
                     id="email"
                     name="email"
                     placeholder="name@milwaukee.gov"
@@ -193,7 +276,7 @@ export default function LoginPage() {
               </div>
 
               {/* Password Field */}
-              <div className="space-y-1.5">
+              <div className={`space-y-1.5 ${isSignup ? 'sm:col-span-1' : ''}`}>
                 <label className="text-xs font-semibold text-on-surface-variant ml-1" htmlFor="password">
                   Password
                 </label>
@@ -204,7 +287,7 @@ export default function LoginPage() {
                     </span>
                   </div>
                   <input
-                    className="block w-full pl-11 pr-4 py-3 bg-surface-container-high border-none rounded-xl text-on-surface placeholder:text-outline/60 focus:ring-0 focus:bg-white transition-all duration-200"
+                    className={`block w-full rounded-xl border-none bg-surface-container-high pl-11 pr-4 text-on-surface transition-all duration-200 placeholder:text-outline/60 focus:bg-white focus:ring-0 ${isSignup ? 'py-2.5' : 'py-3'}`}
                     id="password"
                     name="password"
                     placeholder="••••••••"
@@ -217,6 +300,51 @@ export default function LoginPage() {
                   <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-0 h-0.5 bg-primary transition-all duration-300 group-focus-within:w-full"></div>
                 </div>
               </div>
+
+              {isSignup && (
+                <>
+                  <div className="space-y-1.5 sm:col-span-1">
+                    <label className="ml-1 text-xs font-semibold text-on-surface-variant" htmlFor="displayName">
+                      Full name
+                    </label>
+                    <input
+                      className="block w-full rounded-xl border-none bg-surface-container-high px-4 py-2.5 text-on-surface"
+                      id="displayName"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      required
+                      disabled={busy}
+                    />
+                  </div>
+                  <div className="space-y-1.5 sm:col-span-1">
+                    <label className="ml-1 text-xs font-semibold text-on-surface-variant" htmlFor="organization">
+                      Organization / department
+                    </label>
+                    <input
+                      className="block w-full rounded-xl border-none bg-surface-container-high px-4 py-2.5 text-on-surface"
+                      id="organization"
+                      value={organization}
+                      onChange={(e) => setOrganization(e.target.value)}
+                      required
+                      disabled={busy}
+                    />
+                  </div>
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <label className="ml-1 text-xs font-semibold text-on-surface-variant" htmlFor="accessNote">
+                      Reason for access
+                    </label>
+                    <textarea
+                      className="block min-h-[4.5rem] w-full resize-y rounded-xl border-none bg-surface-container-high px-4 py-2.5 text-on-surface"
+                      id="accessNote"
+                      rows={2}
+                      value={accessNote}
+                      onChange={(e) => setAccessNote(e.target.value)}
+                      required
+                      disabled={busy}
+                    />
+                  </div>
+                </>
+              )}
             </div>
 
             {/* Utilities Row */}
@@ -235,13 +363,14 @@ export default function LoginPage() {
                   Remember me
                 </span>
               </label>
-              <a
+              <button
+                type="button"
                 className="text-xs font-bold text-primary hover:text-primary-dim transition-colors"
-                href="#"
-                onClick={onForgotPassword}
+                onClick={onForgotPasswordClick}
+                disabled={busy}
               >
                 Forgot Password?
-              </a>
+              </button>
             </div>
 
             {err && (
@@ -251,56 +380,96 @@ export default function LoginPage() {
             )}
 
             {/* Actions */}
-            <div className="flex flex-col gap-3 mt-4">
-              <button
-                className="w-full py-4 px-6 bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold rounded-xl shadow-lg shadow-primary/25 active:scale-[0.98] transition-all duration-200 disabled:opacity-60"
-                type="submit"
-                disabled={busy}
-              >
-                {pending === 'login' ? 'Signing in…' : 'Login to Portal'}
-              </button>
-              <button
-                className="w-full py-3.5 px-6 bg-secondary-container text-on-secondary-container font-semibold rounded-xl hover:bg-secondary-container/80 transition-colors disabled:opacity-60"
-                type="button"
-                disabled={busy}
-                onClick={onSignUp}
-              >
-                {pending === 'signup' ? 'Creating account…' : 'Request Access'}
-              </button>
+            <div className={`flex flex-col gap-3 ${isSignup ? 'mt-2' : 'mt-4'}`}>
+              {formMode === 'login' ? (
+                <button
+                  className="w-full rounded-xl bg-gradient-to-r from-primary to-primary-dim px-6 py-4 font-bold text-on-primary shadow-lg shadow-primary/25 transition-all duration-200 active:scale-[0.98] disabled:opacity-60"
+                  type="submit"
+                  disabled={busy}
+                >
+                  {pending === 'login' ? 'Signing in…' : 'Login to Portal'}
+                </button>
+              ) : (
+                <button
+                  className="w-full rounded-xl bg-gradient-to-r from-primary to-primary-dim px-6 py-3.5 font-bold text-on-primary shadow-lg shadow-primary/25 transition-all duration-200 active:scale-[0.98] disabled:opacity-60"
+                  type="button"
+                  disabled={busy}
+                  onClick={onSignUp}
+                >
+                  {pending === 'signup' ? 'Submitting request…' : 'Submit access request'}
+                </button>
+              )}
             </div>
           </form>
 
           {/* Footer Section within Card */}
-          <div className="pt-8 border-t border-outline-variant/10 text-center">
-            <p className="text-[0.65rem] font-medium text-outline uppercase tracking-widest">
+          <div
+            className={`border-t border-outline-variant/10 text-center ${isSignup ? 'pt-4' : 'pt-8'}`}
+          >
+            <p className="px-2 text-[0.65rem] leading-relaxed text-on-surface-variant">
+              By using this portal, you agree to our{' '}
+              <button
+                type="button"
+                className="font-bold text-primary hover:text-primary-dim"
+                onClick={() => openInfoModal('security')}
+              >
+                Security &amp; Terms
+              </button>{' '}
+              and{' '}
+              <button
+                type="button"
+                className="font-bold text-primary hover:text-primary-dim"
+                onClick={() => openInfoModal('privacy')}
+              >
+                Privacy Policy
+              </button>
+              .
+            </p>
+            <p className="mt-3 text-[0.65rem] font-medium text-outline uppercase tracking-widest">
               © 2026 Municipal Forestry Dept.
             </p>
-            <div className="flex justify-center gap-4 mt-2">
-              <a
-                className="text-[0.65rem] font-bold text-on-surface-variant hover:text-primary transition-colors"
-                href="#"
-                onClick={(e) => e.preventDefault()}
+            <div className="mt-2 flex flex-wrap justify-center gap-4">
+              <button
+                type="button"
+                className="text-[0.65rem] font-bold text-on-surface-variant transition-colors hover:text-primary"
+                onClick={() => openInfoModal('privacy')}
               >
                 Privacy
-              </a>
-              <a
-                className="text-[0.65rem] font-bold text-on-surface-variant hover:text-primary transition-colors"
-                href="#"
-                onClick={(e) => e.preventDefault()}
+              </button>
+              <button
+                type="button"
+                className="text-[0.65rem] font-bold text-on-surface-variant transition-colors hover:text-primary"
+                onClick={() => openInfoModal('security')}
               >
                 Security
-              </a>
-              <a
-                className="text-[0.65rem] font-bold text-on-surface-variant hover:text-primary transition-colors"
-                href="#"
-                onClick={(e) => e.preventDefault()}
+              </button>
+              <button
+                type="button"
+                className="text-[0.65rem] font-bold text-on-surface-variant transition-colors hover:text-primary"
+                onClick={() => openInfoModal('help')}
               >
                 Help
-              </a>
+              </button>
             </div>
           </div>
         </div>
       </main>
+
+      {activeInfoModal ? (
+        <LoginInfoModal
+          open
+          title={activeInfoModal.title}
+          onClose={() => setInfoModal(null)}
+        >
+          <InfoModalContent />
+          {infoModal === 'privacy' || infoModal === 'security' ? (
+            <p className="mt-4 border-t border-outline-variant/10 pt-3 text-[10px] text-outline">
+              Last updated: {LOGIN_LEGAL_LAST_UPDATED}. This text is provided for informational purposes
+              only and does not constitute legal advice.
+            </p>
+          ) : null}
+        </LoginInfoModal>
+      ) : null}
 
       {/* Background Image Descriptor */}
       <img

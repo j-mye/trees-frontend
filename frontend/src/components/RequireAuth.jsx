@@ -8,7 +8,7 @@ export default function RequireAuth({ children }) {
   if (!firebaseConfigured) {
     return (
       <div className="auth-gate">
-        <p>Firebase is not configured. Add <code>VITE_FIREBASE_*</code> to <code>.env</code> (see <code>.env.example</code>), or open the static dashboard at <a href="/dashboard.html">/dashboard.html</a>.</p>
+        <p>Firebase is not configured. Add <code>VITE_FIREBASE_*</code> to <code>.env</code> (see <code>.env.example</code>), then open <a href="/dashboard">/dashboard</a>.</p>
       </div>
     )
   }

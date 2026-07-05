@@ -45,25 +45,21 @@ function PantryChip({ variable, className }) {
  * @param {(v: string) => void} props.onSearchTerm
  * @param {{ id: string, name: string, type: 'dimension' }[]} props.filteredDimensions
  * @param {{ id: string, name: string, type: 'measure' }[]} props.filteredMeasures
- * @param {() => void} props.onAddDimension
- * @param {() => void} props.onAddMeasure
- * @param {string} [props.schemaStatus]
+ * @param {string} [props.statusError]
  */
 export function DataDictionaryPane({
   searchTerm,
   onSearchTerm,
   filteredDimensions,
   filteredMeasures,
-  onAddDimension,
-  onAddMeasure,
-  schemaStatus = '',
+  statusError = '',
 }) {
   return (
     <section className="flex min-h-0 w-[20%] min-w-0 flex-col overflow-hidden border-r border-outline-variant/15 bg-surface-container-low">
       <div className="border-b border-outline-variant/15 p-4">
         <h3 className="mb-4 text-xs font-bold uppercase tracking-widest text-on-surface-variant">Data Dictionary</h3>
-        {schemaStatus ? (
-          <p className="mb-2 text-[10px] font-medium text-emerald-700">{schemaStatus}</p>
+        {statusError ? (
+          <p className="mb-2 text-[10px] font-medium text-red-700">{statusError}</p>
         ) : null}
         <div className="relative">
           <input
@@ -83,22 +79,8 @@ export function DataDictionaryPane({
               <span className="material-symbols-outlined shrink-0 text-lg text-primary">category</span>
               <span className="truncate">Dimensions</span>
             </span>
-            <span className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                className="flex h-7 w-7 items-center justify-center rounded-lg border border-transparent text-primary transition-colors hover:border-primary/35 hover:bg-indigo-100 hover:shadow-sm active:brightness-95"
-                aria-label="Add dimension"
-                onClick={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  onAddDimension()
-                }}
-              >
-                <span className="material-symbols-outlined text-lg leading-none">add</span>
-              </button>
-              <span className="material-symbols-outlined text-on-surface-variant transition-transform group-open:rotate-180">
-                expand_more
-              </span>
+            <span className="material-symbols-outlined shrink-0 text-on-surface-variant transition-transform group-open:rotate-180">
+              expand_more
             </span>
           </summary>
           <div className="mt-2 space-y-2 px-2">
@@ -113,22 +95,8 @@ export function DataDictionaryPane({
               <span className="material-symbols-outlined shrink-0 text-lg text-emerald-600">calculate</span>
               <span className="truncate">Measures</span>
             </span>
-            <span className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                className="flex h-7 w-7 items-center justify-center rounded-lg border border-transparent text-emerald-700 transition-colors hover:border-emerald-300/50 hover:bg-emerald-100 hover:shadow-sm active:brightness-95"
-                aria-label="Add measure"
-                onClick={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  onAddMeasure()
-                }}
-              >
-                <span className="material-symbols-outlined text-lg leading-none">add</span>
-              </button>
-              <span className="material-symbols-outlined text-on-surface-variant transition-transform group-open:rotate-180">
-                expand_more
-              </span>
+            <span className="material-symbols-outlined shrink-0 text-on-surface-variant transition-transform group-open:rotate-180">
+              expand_more
             </span>
           </summary>
           <div className="mt-2 space-y-2 px-2">

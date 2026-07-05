@@ -6,6 +6,7 @@ import { serializeDraftQuery } from './draftSerialize.js'
 import { sanitizeChartRowsForDisplay } from './sanitizeChart.js'
 import { fetchAnalyticsQueryRemote } from './remoteAnalytics.js'
 import { downsampleChartRows } from './chartSample.js'
+import { normalizeDraftFilters } from './filterUtils.js'
 
 /** Max points passed to Recharts (memory + paint). */
 const CHART_MAX_POINTS = 3500
@@ -68,12 +69,15 @@ export function useRunAnalyticsMutation(opts) {
   const qc = useQueryClient()
 
   return useMutation({
-    mutationFn: async (/** @type {{ features: { properties?: object }[] }} */ payload) => {
-      const draft = opts.getDraft()
-      const { xAxisItem, yAxisItem, yAggregation, colorItem, draftFilters, chartType } = draft
-      const remoteEnabled = Boolean(mapApiEnv.analyticsQueryUrl && user)
+    mutationFn: async (/** @type {{ features: { properties?: object }[], draftOverride?: object }} */ payload) => {
+      const draft = payload.draftOverride ?? opts.getDraft()
+      const { xAxisItem, yAxisItem, yAggregation, colorItem, chartType } = draft
+      const draftFilters = normalizeDraftFilters(draft.draftFilters ?? [])
+      const features = Array.isArray(payload.features) ? payload.features : []
+      const useClient = features.length > 0
+      const remoteEnabled = Boolean(mapApiEnv.analyticsQueryUrl && user && !useClient)
       console.info('[analytics] run start', {
-        mode: remoteEnabled ? 'remote' : 'client',
+        mode: useClient ? 'client' : remoteEnabled ? 'remote' : 'client',
         analyticsQueryUrl: mapApiEnv.analyticsQueryUrl || null,
         summariesUrl: mapApiEnv.summariesUrl || null,
         featuresCount: Array.isArray(payload.features) ? payload.features.length : 0,
@@ -97,7 +101,7 @@ export function useRunAnalyticsMutation(opts) {
         queryKey: cacheKey,
         staleTime: 5 * 60_000,
         queryFn: async () => {
-          if (mapApiEnv.analyticsQueryUrl && user) {
+          if (!useClient && mapApiEnv.analyticsQueryUrl && user) {
             const token = await user.getIdToken()
             const remote = await fetchAnalyticsQueryRemote({
               token,

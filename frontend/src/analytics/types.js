@@ -3,8 +3,8 @@
  * @typedef {{ id: string, name: string, type: FieldKind, bqColumn?: string, valueType?: 'number' | 'string' }} CatalogField
  * @typedef {{ id: string, name: string, type: FieldKind }} Variable
  * @typedef {'SUM' | 'AVG' | 'COUNT' | 'MAX'} Aggregation
- * @typedef {'eq' | 'gt' | 'lt' | 'gte' | 'lte'} FilterOp
- * @typedef {{ fieldId: string, op: FilterOp, value: string }} DraftFilter
+ * @typedef {'eq' | 'in' | 'gt' | 'lt' | 'gte' | 'lte'} FilterOp
+ * @typedef {{ fieldId: string, op: FilterOp, value: string, values?: string[] }} DraftFilter
  * @typedef {'bar' | 'line' | 'pie' | 'scatter' | 'histogram'} ChartType
  */
 

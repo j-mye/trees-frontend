@@ -22,6 +22,9 @@
       "**/.*",
       "**/node_modules/**"
     ],
+    "redirects": [
+      { "source": "/dashboard.html", "destination": "/dashboard", "type": 301 }
+    ],
     "rewrites": [{ "source": "**", "destination": "/index.html" }]
   }
 }

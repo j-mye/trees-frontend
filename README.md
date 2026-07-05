@@ -50,6 +50,7 @@ Create **`frontend/.env`** (not committed) with at least Firebase web config and
 | `VITE_CF_ANALYTICS_SCHEMA_URL` | Optional analytics schema hint |
 | `VITE_CF_USER_TASKS_API_URL` | User tasks + assignees API |
 | `VITE_CF_TREES_DATA_API_URL` | Data management — `trees_core` CRUD (`treesDataApi`) |
+| `VITE_CF_ACCESS_API_URL` | Access registration + admin approval (`accessApi`) |
 
 Run the dev server:
 
@@ -90,12 +91,15 @@ Functions read BigQuery and Firebase settings from **environment / secrets** con
 | `/analytics` | Chart builder (remote BigQuery and/or client fallback) |
 | `/data-management` | Tree record CRUD (requires `VITE_CF_TREES_DATA_API_URL`) |
 | `/user-tasks` | Users + service requests (requires `VITE_CF_USER_TASKS_API_URL`) |
-| `/login` | Sign-in |
+| `/login` | Sign-in / request access (admin approval required) |
+| `/pending-approval` | Waiting for administrator approval |
+| `/admin/access` | Admin: approve users, assign role/tier |
 
 Legacy paths `/map`, `/priority-map`, `/risk-heatmap` redirect to `/dashboard`.
 
 ## Further reading
 
+- **`docs/ACCESS_CONTROL.md`** — User approval workflow, admin setup, SMTP env vars  
 - **`database/DATABASE_DESIGN.md`** — Schema, tables (`trees_core`, `quarter_sections`, etc.), and migration notes  
 - **`ANALYTICS_WRITEUP.md`** — Analytics UI and `analytics_query` behavior  
 - **`frontend/src/analytics/README.md`** — Analytics module file map  

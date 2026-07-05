@@ -5,6 +5,7 @@ import './stitch-theme.css'
 import './index.css'
 import App from './App.jsx'
 import { AuthProvider } from './contexts/AuthContext.jsx'
+import { AccessProvider } from './contexts/AccessContext.jsx'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -17,7 +18,9 @@ createRoot(document.getElementById('root')).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
-        <App />
+        <AccessProvider>
+          <App />
+        </AccessProvider>
       </AuthProvider>
     </QueryClientProvider>
   </StrictMode>,

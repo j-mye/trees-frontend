@@ -2,10 +2,13 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import {
   CATALOG_DIMENSIONS,
+  CATALOG_FILTERS,
   CATALOG_MEASURES,
   catalogFieldToVariable,
   defaultAggregationForMeasureId,
+  isScopedFilterFieldId,
 } from './fieldCatalog.js'
+import { normalizeDraftFilters } from './filterUtils.js'
 import { pickLegalChartType, allowedChartTypes } from './chartRules.js'
 import { DRAFT_QUERY_VERSION } from './types.js'
 
@@ -17,10 +20,24 @@ import { DRAFT_QUERY_VERSION } from './types.js'
  */
 
 const LEGACY_STORAGE_KEY = 'trees_analytics_builder_v1'
-const PERSIST_NAME = 'trees-analytics-draft-v2'
+const PERSIST_NAME = 'trees-analytics-draft-v3'
 
 /** Renamed or removed catalog ids — drop from persisted pantry so UI stays aligned. */
-const OBSOLETE_VARIABLE_IDS = new Set(['meas-avg-height', 'meas-avg-age', 'meas-avg-crown-diameter'])
+const OBSOLETE_VARIABLE_IDS = new Set([
+  'meas-avg-height',
+  'meas-avg-age',
+  'meas-avg-crown-diameter',
+  'meas-height',
+  'meas-age',
+  'meas-crown-width',
+  'meas-priority-score',
+  'meas-iof',
+  'meas-p-f',
+  'meas-age-prioritization',
+  'dim-tree-status',
+  'dim-risk-to-building',
+  'dim-maintenance-band',
+])
 
 function defaultDimensions() {
   return CATALOG_DIMENSIONS.map(catalogFieldToVariable)
@@ -78,7 +95,7 @@ export function variableInPool(v, dimensions, measures) {
  * @returns {DraftFilter}
  */
 export function defaultDraftFilterForVariable(v) {
-  const fromCat = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES].find((c) => c.id === v.id)
+  const fromCat = [...CATALOG_DIMENSIONS, ...CATALOG_MEASURES, ...CATALOG_FILTERS].find((c) => c.id === v.id)
   if (fromCat?.valueType === 'number') {
     return { fieldId: v.id, op: 'gte', value: '0' }
   }
@@ -134,10 +151,27 @@ export const useAnalyticsDraftStore = create(
         }),
       addFilterVariable: (v) =>
         set((s) => {
+          if (isScopedFilterFieldId(v.id)) return s
           if (s.filterItems.some((p) => p.id === v.id)) return s
           return {
             filterItems: [...s.filterItems, v],
             draftFilters: [...s.draftFilters, defaultDraftFilterForVariable(v)],
+          }
+        }),
+      setInListFilter: (fieldId, values) =>
+        set((s) => {
+          const ids = [...new Set(values.map((v) => String(v).trim()).filter(Boolean))]
+          const others = s.draftFilters.filter((f) => f.fieldId !== fieldId)
+          const othersItems = s.filterItems.filter((p) => p.id !== fieldId)
+          if (!ids.length) {
+            return { draftFilters: others, filterItems: othersItems }
+          }
+          return {
+            draftFilters: [
+              ...others,
+              { fieldId, op: 'in', value: ids.join('|'), values: ids },
+            ],
+            filterItems: othersItems,
           }
         }),
       removeFilterVariable: (id) =>
@@ -225,12 +259,14 @@ export const useAnalyticsDraftStore = create(
         }
         if (Array.isArray(state.filterItems)) {
           patch.filterItems = state.filterItems
-            .filter((v) => v?.id && !OBSOLETE_VARIABLE_IDS.has(v.id))
+            .filter((v) => v?.id && !OBSOLETE_VARIABLE_IDS.has(v.id) && !isScopedFilterFieldId(v.id))
             .map((v) => variableInPool(v, mergedDimensions, mergedMeasures))
             .filter(Boolean)
         }
         if (Array.isArray(state.draftFilters)) {
-          patch.draftFilters = state.draftFilters.filter((f) => f?.fieldId && !OBSOLETE_VARIABLE_IDS.has(f.fieldId))
+          patch.draftFilters = normalizeDraftFilters(state.draftFilters).filter(
+            (f) => f?.fieldId && !OBSOLETE_VARIABLE_IDS.has(f.fieldId),
+          )
         }
         const yAfter = patch.yAxisItem ?? state.yAxisItem
         const aggAfter = patch.yAggregation ?? state.yAggregation
@@ -246,6 +282,7 @@ export const useAnalyticsDraftStore = create(
 export function clearAnalyticsDraftStorage() {
   try {
     sessionStorage.removeItem(PERSIST_NAME)
+    sessionStorage.removeItem('trees-analytics-draft-v2')
     sessionStorage.removeItem(LEGACY_STORAGE_KEY)
   } catch {
     /* ignore */

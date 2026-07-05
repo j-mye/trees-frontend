@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { DndContext, DragOverlay, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import AppNavbar from '../components/AppNavbar.jsx'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import { mapApiEnv } from '../config/mapApiEnv.js'
@@ -7,45 +6,29 @@ import { useAnalyticsDraftStore, migrateLegacyAnalyticsSnapshot, clearAnalyticsD
 import { isDraftRunnable } from '../analytics/draftSerialize.js'
 import { allowedChartTypes, chartDisabledReason, pickLegalChartType } from '../analytics/chartRules.js'
 import { useRunAnalyticsMutation, useSummariesFeaturesQuery } from '../analytics/useAnalyticsData.js'
-import { useAnalyticsSchemaQuery } from '../analytics/useAnalyticsSchemaQuery.js'
-import { DataDictionaryPane } from '../analytics/panes/DataDictionaryPane.jsx'
 import { BuilderPane } from '../analytics/panes/BuilderPane.jsx'
 import { CanvasPane } from '../analytics/panes/CanvasPane.jsx'
-import { PantryDragPreview } from '../analytics/components/PantryDragPreview.jsx'
 import { escapeCsvCell } from '../analytics/csvUtils.js'
 import { geoPropertyKeyForFieldId } from '../analytics/clientAggregate.js'
-
-/**
- * @param {'x' | 'y' | 'color' | 'filters'} zone
- * @param {{ type: string } | null} variable
- */
-function zoneAcceptsVariable(zone, variable) {
-  if (!variable) return false
-  if (zone === 'x') return variable.type === 'dimension'
-  if (zone === 'color') return variable.type === 'dimension'
-  if (zone === 'y') return variable.type === 'measure'
-  if (zone === 'filters') return true
-  return false
-}
+import { FILTER_DISTRICT_ID, FILTER_QUARTER_SECTION_ID } from '../analytics/fieldCatalog.js'
+import { buildAnalyticsChartTitle } from '../analytics/chartTitle.js'
+import { isUnknownCatalogValue, parseInFilterValues } from '../analytics/filterUtils.js'
+import { quarterSectionIdFromProperties } from '../analytics/quarterSectionId.js'
 
 export default function AnalyticsPage() {
   const { user, loading: authLoading } = useAuth()
 
   const canvasSectionRef = useRef(/** @type {HTMLElement | null} */ (null))
   const [infoOpen, setInfoOpen] = useState(false)
-  const [dragActive, setDragActive] = useState(false)
-  const [activePantryVariable, setActivePantryVariable] = useState(
-    /** @type {{ id: string, name: string, type: 'dimension' | 'measure' } | null} */ (null),
-  )
   const [lastResult, setLastResult] = useState(
     /** @type {{ rows: { xLabel: string, yValue: number, series?: string }[]; source: string; meta?: { rowsReturned: number; chartMaxPoints: number; chartSampled: boolean; chartOriginalCount: number } } | null} */ (
       null
     ),
   )
+  const [runAttempted, setRunAttempted] = useState(false)
 
   const dimensions = useAnalyticsDraftStore((s) => s.dimensions)
   const measures = useAnalyticsDraftStore((s) => s.measures)
-  const searchTerm = useAnalyticsDraftStore((s) => s.searchTerm)
   const xAxisItem = useAnalyticsDraftStore((s) => s.xAxisItem)
   const yAxisItem = useAnalyticsDraftStore((s) => s.yAxisItem)
   const yAggregation = useAnalyticsDraftStore((s) => s.yAggregation)
@@ -54,7 +37,6 @@ export default function AnalyticsPage() {
   const draftFilters = useAnalyticsDraftStore((s) => s.draftFilters)
   const chartType = useAnalyticsDraftStore((s) => s.chartType)
 
-  const setSearchTerm = useAnalyticsDraftStore((s) => s.setSearchTerm)
   const setXAxisItem = useAnalyticsDraftStore((s) => s.setXAxisItem)
   const setYAxisItem = useAnalyticsDraftStore((s) => s.setYAxisItem)
   const setYAggregation = useAnalyticsDraftStore((s) => s.setYAggregation)
@@ -66,19 +48,11 @@ export default function AnalyticsPage() {
   const addFilterVariable = useAnalyticsDraftStore((s) => s.addFilterVariable)
   const removeFilterVariable = useAnalyticsDraftStore((s) => s.removeFilterVariable)
   const updateDraftFilter = useAnalyticsDraftStore((s) => s.updateDraftFilter)
-  const addDimension = useAnalyticsDraftStore((s) => s.addDimension)
-  const addMeasure = useAnalyticsDraftStore((s) => s.addMeasure)
+  const setInListFilter = useAnalyticsDraftStore((s) => s.setInListFilter)
   const resetDraft = useAnalyticsDraftStore((s) => s.resetDraft)
 
   const featuresQuery = useSummariesFeaturesQuery()
-  const schemaQuery = useAnalyticsSchemaQuery()
   const loadError = featuresQuery.error ? String(featuresQuery.error.message) : ''
-  const schemaStatus =
-    schemaQuery.isSuccess && schemaQuery.data
-      ? `Schema endpoint: ${Array.isArray(schemaQuery.data?.dimensions) ? schemaQuery.data.dimensions.length : 0} dims`
-      : schemaQuery.isError
-        ? `Schema: ${String(schemaQuery.error?.message ?? schemaQuery.error)}`
-        : ''
 
   const getDraft = useCallback(
     () => ({
@@ -99,64 +73,49 @@ export default function AnalyticsPage() {
     migrateLegacyAnalyticsSnapshot(user.uid)
   }, [authLoading, user?.uid])
 
-  useEffect(() => {
-    if (!user?.uid) return
-    console.info('[analytics] env', {
-      uid: user.uid,
-      summariesUrl: mapApiEnv.summariesUrl || null,
-      analyticsQueryUrl: mapApiEnv.analyticsQueryUrl || null,
-      analyticsSchemaUrl: mapApiEnv.analyticsSchemaUrl || null,
-    })
-  }, [user?.uid])
-
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }))
-
-  const handleDragStart = useCallback((event) => {
-    setDragActive(true)
-    const v = event.active.data.current?.variable
-    setActivePantryVariable(v && typeof v === 'object' && 'id' in v && 'type' in v ? v : null)
-  }, [])
-
-  const handleDragCancel = useCallback(() => {
-    setDragActive(false)
-    setActivePantryVariable(null)
-  }, [])
-
-  const handleDragEnd = useCallback(
-    (event) => {
-      setDragActive(false)
-      setActivePantryVariable(null)
-      const { active, over } = event
-      if (!over?.data?.current?.zone) return
-      const zone = /** @type {'x'|'y'|'color'|'filters'} */ (over.data.current.zone)
-      const variable = active.data.current?.variable
-      if (!variable || !zoneAcceptsVariable(zone, variable)) return
-      if (zone === 'filters') {
-        addFilterVariable(variable)
-        return
-      }
-      if (zone === 'x') setXAxisItem(variable)
-      if (zone === 'y') setYAxisItem(variable)
-      if (zone === 'color') setColorItem(variable)
-    },
-    [addFilterVariable, setXAxisItem, setYAxisItem, setColorItem],
-  )
-
-  const filteredDimensions = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase()
-    if (!q) return dimensions
-    return dimensions.filter((d) => d.name.toLowerCase().includes(q) || d.id.toLowerCase().includes(q))
-  }, [dimensions, searchTerm])
-
-  const filteredMeasures = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase()
-    if (!q) return measures
-    return measures.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q))
-  }, [measures, searchTerm])
-
   const colorOptions = useMemo(
     () => [{ value: '', label: 'None' }, ...dimensions.map((d) => ({ value: d.id, label: d.name }))],
     [dimensions],
+  )
+
+  const quarterSectionOptions = useMemo(() => {
+    const feats = featuresQuery.data ?? []
+    const ids = new Set()
+    for (const feat of feats) {
+      const qs = quarterSectionIdFromProperties(feat?.properties)
+      if (qs) ids.add(qs)
+    }
+    return [...ids].sort((a, b) => a.localeCompare(b)).map((id) => ({ value: id, label: id }))
+  }, [featuresQuery.data])
+
+  const districtOptions = useMemo(() => {
+    const feats = featuresQuery.data ?? []
+    const districts = new Set()
+    for (const feat of feats) {
+      const d = String(feat?.properties?.district ?? '').trim()
+      if (d && !isUnknownCatalogValue(d)) districts.add(d)
+    }
+    return [...districts].sort((a, b) => a.localeCompare(b)).map((d) => ({ value: d, label: d }))
+  }, [featuresQuery.data])
+
+  const selectedQuarterSections = useMemo(
+    () => parseInFilterValues(draftFilters, FILTER_QUARTER_SECTION_ID),
+    [draftFilters],
+  )
+
+  const selectedDistricts = useMemo(
+    () => parseInFilterValues(draftFilters, FILTER_DISTRICT_ID),
+    [draftFilters],
+  )
+
+  const onQuarterSectionsChange = useCallback(
+    (values) => setInListFilter(FILTER_QUARTER_SECTION_ID, values),
+    [setInListFilter],
+  )
+
+  const onDistrictsChange = useCallback(
+    (values) => setInListFilter(FILTER_DISTRICT_ID, values),
+    [setInListFilter],
   )
 
   const filterValueOptionsByField = useMemo(() => {
@@ -184,19 +143,34 @@ export default function AnalyticsPage() {
 
   const onSelectColorId = useCallback(
     (id) => {
-      if (!id) {
-        clearColor()
-        return
-      }
+      if (!id) { clearColor(); return }
       const next = dimensions.find((d) => d.id === id) ?? null
       if (next) setColorItem(next)
     },
     [clearColor, dimensions, setColorItem],
   )
 
-  const runnable = useMemo(() => isDraftRunnable({ xAxisItem, yAxisItem, yAggregation, colorItem }), [xAxisItem, yAxisItem, yAggregation, colorItem])
+  const chartTitle = useMemo(
+    () =>
+      buildAnalyticsChartTitle({
+        xAxisItem,
+        yAxisItem,
+        yAggregation,
+        selectedQuarterSections,
+        selectedDistricts,
+      }),
+    [xAxisItem, yAxisItem, yAggregation, selectedQuarterSections, selectedDistricts],
+  )
 
-  const allowedCharts = useMemo(() => allowedChartTypes({ xAxisItem, yAxisItem, colorItem }), [xAxisItem, yAxisItem, colorItem])
+  const runnable = useMemo(
+    () => isDraftRunnable({ xAxisItem, yAxisItem, yAggregation, colorItem }),
+    [xAxisItem, yAxisItem, yAggregation, colorItem],
+  )
+
+  const allowedCharts = useMemo(
+    () => allowedChartTypes({ xAxisItem, yAxisItem, colorItem }),
+    [xAxisItem, yAxisItem, colorItem],
+  )
 
   const reasonForChartType = useCallback((t) => chartDisabledReason(t, allowedCharts), [allowedCharts])
 
@@ -207,6 +181,7 @@ export default function AnalyticsPage() {
       {
         onSuccess: (data) => {
           setLastResult(data)
+          setRunAttempted(true)
           const st = useAnalyticsDraftStore.getState()
           const allowed = allowedChartTypes({
             xAxisItem: st.xAxisItem,
@@ -224,6 +199,7 @@ export default function AnalyticsPage() {
     clearAnalyticsDraftStorage()
     resetDraft()
     setLastResult(null)
+    setRunAttempted(false)
     runMutation.reset()
   }, [resetDraft, runMutation])
 
@@ -258,25 +234,10 @@ export default function AnalyticsPage() {
     setTimeout(() => URL.revokeObjectURL(url), 2000)
   }, [lastResult, xAxisItem, yAxisItem])
 
-  const onAddDimension = useCallback(() => {
-    const name = window.prompt('Name for new dimension:')
-    if (name == null) return
-    const trimmed = name.trim()
-    if (!trimmed) return
-    addDimension(trimmed)
-  }, [addDimension])
-
-  const onAddMeasure = useCallback(() => {
-    const name = window.prompt('Name for new measure:')
-    if (name == null) return
-    const trimmed = name.trim()
-    if (!trimmed) return
-    addMeasure(trimmed)
-  }, [addMeasure])
-
   return (
     <div className="h-screen w-screen overflow-hidden bg-surface text-on-surface">
       <AppNavbar />
+
       {infoOpen ? (
         <div className="fixed inset-0 z-[12000] flex items-center justify-center bg-black/45 p-4">
           <div className="w-full max-w-2xl rounded-2xl border border-outline-variant/20 bg-surface-container-lowest p-5 shadow-2xl">
@@ -292,18 +253,13 @@ export default function AnalyticsPage() {
               </button>
             </div>
             <div className="space-y-2 text-sm text-on-surface-variant">
-              <p><strong className="text-on-surface">Dimension</strong>: category to group by (for example Species or District).</p>
-              <p><strong className="text-on-surface">Measure</strong>: numeric value to aggregate (for example Tree Count or DBH).</p>
-              <p><strong className="text-on-surface">X-axis</strong>: drag a dimension to group categories (for example Species or District).</p>
-              <p className="text-xs">Large result sets are downsampled in the chart for browser performance (~3.5k points). Export CSV uses the displayed rows.</p>
-              <p><strong className="text-on-surface">Bar</strong>: compares totals/averages across categories.</p>
-              <p><strong className="text-on-surface">Line</strong>: best for trends across ordered categories (like years).</p>
-              <p><strong className="text-on-surface">Pie</strong>: shows composition as parts of a whole.</p>
-              <p><strong className="text-on-surface">Scatter</strong>: compares points to spot clusters and outliers.</p>
-              <p><strong className="text-on-surface">Filters</strong>: drag a field into Filters, then set operator and value to narrow results.</p>
-              <p><strong className="text-on-surface">Color / Legend</strong>: choose a dimension to split one chart into series.</p>
-              <p><strong className="text-on-surface">Histogram</strong>: shows the distribution of the selected measure values.</p>
-              <p className="pt-1 text-xs">Tip: if you see lots of <em>Unknown</em>, add a filter like Species = your target value.</p>
+              <p><strong className="text-on-surface">Quick Insights</strong>: click any tile on the left to instantly load a pre-built chart.</p>
+              <p><strong className="text-on-surface">Custom Chart</strong>: choose a "Group by" category (e.g. Species or District) and a Measure (e.g. Tree Count), then click Generate Chart.</p>
+              <p><strong className="text-on-surface">Aggregation</strong>: how the measure is combined within each group — SUM, AVG, MAX, or COUNT.</p>
+              <p><strong className="text-on-surface">Color / Split by</strong>: choose a second dimension to break the chart into multiple series (e.g. Priority Level within each District).</p>
+              <p><strong className="text-on-surface">Filters</strong>: narrow results to specific quarter sections, districts, or other field values.</p>
+              <p><strong className="text-on-surface">Chart types</strong>: switch between Bar, Line, Pie, Scatter, and Histogram using the toolbar above the chart.</p>
+              <p className="pt-1 text-xs">Charts are computed client-side from the same quarter-section summary data as the map — same source, instant results.</p>
             </div>
             <div className="mt-4 flex justify-end">
               <button
@@ -318,82 +274,76 @@ export default function AnalyticsPage() {
         </div>
       ) : null}
 
-      <DndContext
-        sensors={sensors}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onDragCancel={handleDragCancel}
-      >
-        <main className="relative mt-16 flex h-[calc(100vh-4rem)] min-h-0 w-full overflow-hidden">
-          <div className="flex h-full min-h-0 w-full flex-1">
-            <DataDictionaryPane
-              searchTerm={searchTerm}
-              onSearchTerm={setSearchTerm}
-              filteredDimensions={filteredDimensions}
-              filteredMeasures={filteredMeasures}
-              onAddDimension={onAddDimension}
-              onAddMeasure={onAddMeasure}
-              schemaStatus={mapApiEnv.analyticsSchemaUrl ? schemaStatus : ''}
-            />
-            <BuilderPane
-              dragActive={dragActive}
-              xAxisItem={xAxisItem}
-              yAxisItem={yAxisItem}
-              yAggregation={yAggregation}
-              onYAggregation={setYAggregation}
-              colorItem={colorItem}
-              filterItems={filterItems}
-              draftFilters={draftFilters}
-              onUpdateDraftFilter={updateDraftFilter}
-              onClearX={clearX}
-              onClearY={clearY}
-              onClearColor={clearColor}
-              onRemoveFilter={removeFilterVariable}
-              colorOptions={colorOptions}
-              selectedColorId={colorItem?.id ?? ''}
-              onSelectColorId={onSelectColorId}
-              filterValueOptionsByField={filterValueOptionsByField}
-              canRun={runnable && !featuresQuery.isLoading && Boolean(featuresQuery.data)}
-              runBusy={runMutation.isPending}
-              onRunQuery={onRunQuery}
-            />
-            <CanvasPane
-              canvasSectionRef={canvasSectionRef}
-              hasResult={Boolean(lastResult?.rows?.length)}
-              rows={lastResult?.rows ?? []}
-              resultMeta={lastResult?.meta ?? null}
-              chartType={chartType}
-              onChartType={setChartType}
-              allowedChartTypes={allowedCharts}
-              chartDisabledReason={reasonForChartType}
-              xAxisTitle={xAxisItem?.name ?? ''}
-              yAxisTitle={
-                yAxisItem
-                  ? `${yAxisItem.name} (${yAggregation})`
-                  : ''
-              }
-              loadError={featuresQuery.isError ? loadError : mapApiEnv.summariesUrl ? '' : 'Missing summaries API URL.'}
-              runError={runMutation.isError ? String(runMutation.error?.message ?? runMutation.error) : ''}
-              onReset={resetGraph}
-              onFullscreen={toggleCanvasFullscreen}
-              onExportCsv={exportCsv}
-              exportDisabled={!lastResult?.rows?.length}
-            />
-          </div>
-          <button
-            type="button"
-            aria-label="Open analytics help"
-            title="How analytics works"
-            className="absolute right-4 top-3 z-[90] flex h-8 w-8 items-center justify-center rounded-full border border-outline-variant/20 bg-surface-container-lowest text-on-surface-variant shadow hover:text-primary"
-            onClick={() => setInfoOpen(true)}
-          >
-            <span className="material-symbols-outlined text-base">info</span>
-          </button>
-        </main>
-        <DragOverlay dropAnimation={null} className="z-[10000]" style={{ cursor: 'grabbing' }}>
-          {activePantryVariable ? <PantryDragPreview variable={activePantryVariable} /> : null}
-        </DragOverlay>
-      </DndContext>
+      <main className="relative mt-16 flex h-[calc(100vh-4rem)] min-h-0 w-full overflow-hidden">
+        <BuilderPane
+          xAxisItem={xAxisItem}
+          yAxisItem={yAxisItem}
+          yAggregation={yAggregation}
+          onSetX={setXAxisItem}
+          onClearX={clearX}
+          onSetY={setYAxisItem}
+          onClearY={clearY}
+          onYAggregation={setYAggregation}
+          colorItem={colorItem}
+          colorOptions={colorOptions}
+          selectedColorId={colorItem?.id ?? ''}
+          onSelectColorId={onSelectColorId}
+          onClearColor={clearColor}
+          filterItems={filterItems}
+          draftFilters={draftFilters}
+          onUpdateDraftFilter={updateDraftFilter}
+          onRemoveFilter={removeFilterVariable}
+          onAddFilterVariable={addFilterVariable}
+          filterValueOptionsByField={filterValueOptionsByField}
+          quarterSectionOptions={quarterSectionOptions}
+          selectedQuarterSections={selectedQuarterSections}
+          onQuarterSectionsChange={onQuarterSectionsChange}
+          districtOptions={districtOptions}
+          selectedDistricts={selectedDistricts}
+          onDistrictsChange={onDistrictsChange}
+          dimensions={dimensions}
+          measures={measures}
+          canRun={runnable && !featuresQuery.isLoading && Boolean(featuresQuery.data)}
+          runBusy={runMutation.isPending}
+          onRunQuery={onRunQuery}
+          dataLoading={featuresQuery.isLoading}
+        />
+        <CanvasPane
+          canvasSectionRef={canvasSectionRef}
+          hasResult={Boolean(lastResult?.rows?.length)}
+          rows={lastResult?.rows ?? []}
+          resultMeta={lastResult?.meta ?? null}
+          chartType={chartType}
+          onChartType={setChartType}
+          allowedChartTypes={allowedCharts}
+          chartDisabledReason={reasonForChartType}
+          chartTitle={chartTitle}
+          xAxisTitle={xAxisItem?.name ?? ''}
+          yAxisTitle={
+            yAxisItem
+              ? `${yAxisItem.name} (${yAggregation})`
+              : ''
+          }
+          loadError={featuresQuery.isError ? loadError : mapApiEnv.summariesUrl ? '' : 'Missing summaries API URL.'}
+          runError={runMutation.isError ? String(runMutation.error?.message ?? runMutation.error) : ''}
+          onReset={resetGraph}
+          onFullscreen={toggleCanvasFullscreen}
+          onExportCsv={exportCsv}
+          exportDisabled={!lastResult?.rows?.length}
+          dataLoading={featuresQuery.isLoading}
+          runAttempted={runAttempted}
+          runIsEmpty={runAttempted && !lastResult?.rows?.length && !runMutation.isPending && !runMutation.isError}
+        />
+        <button
+          type="button"
+          aria-label="Open analytics help"
+          title="How analytics works"
+          className="absolute right-4 top-3 z-[90] flex h-8 w-8 items-center justify-center rounded-full border border-outline-variant/20 bg-surface-container-lowest text-on-surface-variant shadow hover:text-primary"
+          onClick={() => setInfoOpen(true)}
+        >
+          <span className="material-symbols-outlined text-base">info</span>
+        </button>
+      </main>
     </div>
   )
 }

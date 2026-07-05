@@ -5,16 +5,33 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import { mapApiEnv } from '../config/mapApiEnv.js'
 import { useTreeShapExplanation } from '../hooks/useTreeShapExplanation.js'
+import { shapSiteIdFromTree } from '../utils/shapLookup.js'
 import AppNavbar from '../components/AppNavbar.jsx'
+import { PriorityTuningPanel } from '../components/map/PriorityTuningPanel.jsx'
+import { InventoryInsightPanel } from '../components/inventory/InventoryInsightPanel.jsx'
+import {
+  averageLastPrunedFromTrees,
+  avgLastPrunedFromSummaryProperties,
+  formatAvgLastPruned,
+} from '../utils/inventoryStats.js'
+import {
+  applyPriorityTuningToGeojson,
+  computePriorityFactorBreakdown,
+  DEFAULT_PRIORITY_TUNING,
+  enrichPruneQueueRowsWithPsMetrics,
+  formatPsComposite,
+} from '../utils/priorityModel.js'
 import {
   buildDiscreteQsFillExpression,
   buildQsLabelPoints,
   buildQsScoreTreeMinVisibilityFilter,
+  colorFromScore,
   computeQsScoreBinBounds,
   DEFAULT_MAP_STYLE,
   enrichQsGeojsonWithMapLevel,
   featureMatchesScoreTreeMinFilters,
   featureQsHasTrees,
+  geojsonWithMapGeometryOnly,
   qsLinePaint,
 } from '../map/riskLayers.js'
 
@@ -22,8 +39,9 @@ import {
  * @typedef {object} TreePriorityRow
  * @property {string} tree_id
  * @property {number} priority_score
- * @property {number} risk_term_k1_I_f_p_f_b
- * @property {number} age_term_k3_a_p
+ * @property {number | null} [i_f]
+ * @property {number | null} [p_f]
+ * @property {number | null} [a_p]
  * @property {number} age
  * @property {number} maintenance_deficit
  * @property {number} years_since_pruned
@@ -44,7 +62,99 @@ const STAT_CARD_CLASS = 'bg-slate-50 p-3 rounded-xl border border-slate-100'
 const STAT_LABEL_CLASS = 'text-[10px] font-bold text-slate-400 uppercase mb-1'
 const STAT_VALUE_CLASS = 'text-xl font-black text-slate-700'
 /** Bumped when getTreesByQs tree row shape changes (avoids stale session cache without height). */
-const QS_TREES_CLIENT_CACHE_TAG = 'v2'
+const QS_TREES_CLIENT_CACHE_TAG = 'v7-site-id'
+/** Bumped when summaries GeoJSON properties change (avoids stale browser HTTP cache). */
+const SUMMARIES_CLIENT_CACHE_TAG = 'v3-priority-factors'
+const PRUNE_QUEUE_METRICS_BACKFILL_LIMIT = 40
+
+const PRUNE_QUEUE_PRIORITY_ORDER = /** @type {const} */ ({
+  Critical: 4,
+  High: 3,
+  Medium: 2,
+  Low: 1,
+})
+
+/** @typedef {'qsId' | 'psComposite' | 'priorityLevel' | 'district' | 'treeCount' | 'topSpecies' | 'avgLastPruned'} PruneQueueSortKey */
+
+/**
+ * @param {object} row
+ * @param {PruneQueueSortKey} key
+ * @returns {number | string | null}
+ */
+function pruneQueueSortValue(row, key) {
+  switch (key) {
+    case 'qsId':
+      return row.qsId
+    case 'psComposite':
+      return row.psComposite
+    case 'priorityLevel':
+      return PRUNE_QUEUE_PRIORITY_ORDER[row.relativeLevel ?? row.priorityLevel] ?? 0
+    case 'district':
+      return row.district
+    case 'treeCount':
+      return row.treeCount
+    case 'topSpecies':
+      return row.topSpecies
+    case 'avgLastPruned':
+      return row.avgLastPruned
+    default:
+      return null
+  }
+}
+
+/**
+ * @param {Array<Record<string, unknown>>} rows
+ * @param {PruneQueueSortKey} key
+ * @param {'asc' | 'desc'} direction
+ */
+function sortPruneQueueRows(rows, key, direction) {
+  const dir = direction === 'asc' ? 1 : -1
+  return [...rows].sort((a, b) => {
+    const av = pruneQueueSortValue(a, key)
+    const bv = pruneQueueSortValue(b, key)
+    if (av == null && bv == null) return a.qsId.localeCompare(b.qsId) * dir
+    if (av == null) return 1
+    if (bv == null) return -1
+    if (typeof av === 'number' && typeof bv === 'number') {
+      if (av !== bv) return (av - bv) * dir
+      return a.qsId.localeCompare(b.qsId) * dir
+    }
+    const cmp = String(av).localeCompare(String(bv), undefined, { sensitivity: 'base' })
+    if (cmp !== 0) return cmp * dir
+    return a.qsId.localeCompare(b.qsId) * dir
+  })
+}
+
+/**
+ * @param {object} props
+ * @param {string} props.label
+ * @param {PruneQueueSortKey} props.columnKey
+ * @param {PruneQueueSortKey} props.activeKey
+ * @param {'asc' | 'desc'} props.direction
+ * @param {(key: PruneQueueSortKey) => void} props.onSort
+ * @param {string} [props.className]
+ */
+function PruneQueueSortHeader({ label, columnKey, activeKey, direction, onSort, className = '' }) {
+  const active = activeKey === columnKey
+  const alignRight = className.includes('text-right')
+  return (
+    <th className={className}>
+      <button
+        type="button"
+        className={`inline-flex items-center gap-1 transition-colors hover:text-slate-800 ${
+          alignRight ? 'ml-auto' : ''
+        } ${active ? 'text-indigo-700' : ''}`}
+        onClick={() => onSort(columnKey)}
+        aria-sort={active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+      >
+        {label}
+        <span className="text-[9px] opacity-70" aria-hidden>
+          {active ? (direction === 'asc' ? '▲' : '▼') : '↕'}
+        </span>
+      </button>
+    </th>
+  )
+}
 
 const QS_SOURCE_ID = 'qs-source'
 const QS_FILL_LAYER_ID = 'qs-fill-layer'
@@ -175,8 +285,9 @@ export default function MapDashboardPage() {
   const [error, setError] = useState('')
 
   const [showTrees, setShowTrees] = useState(true)
-  const [priorityMin, setPriorityMin] = useState(0)
-  const [priorityMax, setPriorityMax] = useState(100)
+  const [psMin, setPsMin] = useState(0)
+  const [psMax, setPsMax] = useState(Number.MAX_SAFE_INTEGER)
+  const psFilterInitializedRef = useRef(false)
   const [treeMin, setTreeMin] = useState(0)
   const [district, setDistrict] = useState('all')
   const [treePopup, setTreePopup] = useState(null)
@@ -184,6 +295,17 @@ export default function MapDashboardPage() {
   const [focusedTreeSiteId, setFocusedTreeSiteId] = useState(/** @type {string | null} */ (null))
   /** Inventory: map vs ranked pruning-priority list (same data as map summaries / `qs_priority`). */
   const [inventoryView, setInventoryView] = useState(/** @type {'map' | 'prune-queue'} */ ('map'))
+  const [pruneQueueSort, setPruneQueueSort] = useState(
+    /** @type {{ key: PruneQueueSortKey, direction: 'asc' | 'desc' }} */ ({
+      key: 'psComposite',
+      direction: 'desc',
+    }),
+  )
+  const [pruneQueueAvgLastPrunedByQsId, setPruneQueueAvgLastPrunedByQsId] = useState(
+    /** @type {Record<string, number>} */ ({}),
+  )
+  const [priorityTuning, setPriorityTuning] = useState(() => ({ ...DEFAULT_PRIORITY_TUNING }))
+  const pruneQueueBackfillRef = useRef(new Set())
   const mapRef = useRef(null)
 
   const summariesUrl = mapApiEnv.summariesUrl
@@ -192,8 +314,15 @@ export default function MapDashboardPage() {
 
   const queryClient = useQueryClient()
 
+  const focusedTree = useMemo(() => {
+    if (!focusedTreeSiteId) return null
+    return (
+      selectedTrees.find((t) => treeIdFromRecord(t) === focusedTreeSiteId) ?? null
+    )
+  }, [selectedTrees, focusedTreeSiteId])
+
   const shapExplanationQuery = useTreeShapExplanation({
-    siteId: selectedQs && focusedTreeSiteId ? focusedTreeSiteId : null,
+    siteId: focusedTree ? shapSiteIdFromTree(focusedTree) : null,
     shapExplanationUrl,
   })
 
@@ -241,9 +370,12 @@ export default function MapDashboardPage() {
       setError('')
       try {
         const token = await user.getIdToken()
-        const res = await fetch(summariesUrl, {
+        const summariesSep = summariesUrl.includes('?') ? '&' : '?'
+        const summariesFetchUrl = `${summariesUrl}${summariesSep}schema=${encodeURIComponent(SUMMARIES_CLIENT_CACHE_TAG)}`
+        const res = await fetch(summariesFetchUrl, {
           method: 'GET',
           credentials: 'omit',
+          cache: 'no-store',
           headers: { Authorization: `Bearer ${token}` },
         })
         const text = await res.text()
@@ -270,6 +402,8 @@ export default function MapDashboardPage() {
           setTreePopup(null)
           setSelectedTrees([])
           setTreeFetchError('')
+          setPruneQueueAvgLastPrunedByQsId({})
+          pruneQueueBackfillRef.current = new Set()
         }
       } catch (err) {
         if (!cancelled) {
@@ -288,30 +422,98 @@ export default function MapDashboardPage() {
   /** GeoJSON with `_map_level` for consistent priority labeling on features. */
   const qsMapGeojson = useMemo(() => enrichQsGeojsonWithMapLevel(geojson), [geojson])
 
+  const tunedQsMapGeojson = useMemo(
+    () => applyPriorityTuningToGeojson(qsMapGeojson, priorityTuning),
+    [qsMapGeojson, priorityTuning],
+  )
+
+  /** Map polygons only — excludes qs_priority rows with no quarter_sections geometry. */
+  const tunedQsMapGeojsonForMap = useMemo(
+    () => geojsonWithMapGeometryOnly(tunedQsMapGeojson),
+    [tunedQsMapGeojson],
+  )
+
+  const psFilterBounds = useMemo(() => {
+    if (!Array.isArray(tunedQsMapGeojson?.features) || tunedQsMapGeojson.features.length === 0) {
+      return { min: 0, max: 1, step: 0.01 }
+    }
+    const bounds = computeQsScoreBinBounds(tunedQsMapGeojson, { usePercentile: false })
+    const min = Number.isFinite(bounds.min) ? bounds.min : 0
+    const max = Number.isFinite(bounds.max) && bounds.max > min ? bounds.max : min + 1
+    const span = max - min
+    const step = span < 1 ? 0.001 : span < 10 ? 0.01 : 0.1
+    return { min, max, step }
+  }, [tunedQsMapGeojson])
+
+  useEffect(() => {
+    if (!Array.isArray(tunedQsMapGeojson?.features) || tunedQsMapGeojson.features.length === 0) return
+    if (psFilterInitializedRef.current) return
+    setPsMin(psFilterBounds.min)
+    setPsMax(psFilterBounds.max)
+    psFilterInitializedRef.current = true
+  }, [tunedQsMapGeojson, psFilterBounds.min, psFilterBounds.max])
+
+  const mapControlFilterState = useMemo(
+    () => ({ psMin, psMax, treeMin, district }),
+    [district, psMax, psMin, treeMin]
+  )
+
+  const priorityFactorBreakdown = useMemo(
+    () =>
+      computePriorityFactorBreakdown(
+        tunedQsMapGeojson?.features ?? [],
+        (f) => featureMatchesScoreTreeMinFilters(f, mapControlFilterState),
+        priorityTuning,
+      ),
+    [tunedQsMapGeojson, mapControlFilterState, priorityTuning],
+  )
+
+  useEffect(() => {
+    if (!Array.isArray(geojson?.features)) return
+    /** @type {Record<string, number>} */
+    const fromSummaries = {}
+    for (const f of geojson.features) {
+      const p = f.properties || {}
+      const qsId = qsIdFromFeatureProperties(p)
+      const avg = avgLastPrunedFromSummaryProperties(p)
+      if (qsId && avg != null) fromSummaries[qsId] = avg
+    }
+    if (Object.keys(fromSummaries).length === 0) return
+    setPruneQueueAvgLastPrunedByQsId((prev) => ({ ...prev, ...fromSummaries }))
+  }, [geojson])
+
   /**
    * Bounds for 15 discrete fill bins from loaded GeoJSON (see `computeQsScoreBinBounds` in riskLayers).
    * Until `geojson` arrives, same-tab session cache can hydrate min/max for faster repeat visits.
    */
   const scoreBounds = useMemo(() => {
-    if (Array.isArray(geojson?.features) && geojson.features.length > 0) {
-      return computeQsScoreBinBounds(geojson)
+    if (Array.isArray(tunedQsMapGeojson?.features) && tunedQsMapGeojson.features.length > 0) {
+      return computeQsScoreBinBounds(tunedQsMapGeojson, {
+        usePercentile: priorityTuning.usePercentileColors,
+        lowPct: priorityTuning.colorPercentileLow,
+        highPct: priorityTuning.colorPercentileHigh,
+      })
     }
     const cached = readQsScoreBoundsCache(summariesUrl, user?.uid)
     if (cached) return cached
     return { min: 0, max: 100 }
-  }, [geojson, summariesUrl, user?.uid])
+  }, [tunedQsMapGeojson, priorityTuning, summariesUrl, user?.uid])
 
   useEffect(() => {
-    if (!Array.isArray(geojson?.features) || geojson.features.length === 0) return
+    if (!Array.isArray(tunedQsMapGeojson?.features) || tunedQsMapGeojson.features.length === 0) return
     if (!summariesUrl?.trim() || !user?.uid) return
-    const b = computeQsScoreBinBounds(geojson)
+    const b = computeQsScoreBinBounds(tunedQsMapGeojson, {
+      usePercentile: priorityTuning.usePercentileColors,
+      lowPct: priorityTuning.colorPercentileLow,
+      highPct: priorityTuning.colorPercentileHigh,
+    })
     try {
       sessionStorage.setItem(
         QS_SCORE_BOUNDS_STORAGE_KEY,
         JSON.stringify({
           min: b.min,
           max: b.max,
-          featureCount: geojson.features.length,
+          featureCount: tunedQsMapGeojson.features.length,
           summariesUrl,
           uid: user.uid,
           savedAt: Date.now(),
@@ -320,40 +522,32 @@ export default function MapDashboardPage() {
     } catch {
       /* ignore quota / private mode */
     }
-  }, [geojson, summariesUrl, user?.uid])
-
-  const mapControlFilterState = useMemo(
-    () => ({ priorityMin, priorityMax, treeMin, district }),
-    [district, priorityMax, priorityMin, treeMin]
-  )
+  }, [tunedQsMapGeojson, priorityTuning, summariesUrl, user?.uid])
 
   const qsMapLayerFilter = useMemo(
     () =>
       buildQsScoreTreeMinVisibilityFilter({
-        priorityMin,
-        priorityMax,
+        psMin,
+        psMax,
         treeMin,
         district,
       }),
-    [district, priorityMax, priorityMin, treeMin]
+    [district, psMax, psMin, treeMin]
   )
 
-  /** Overview stats: same rules as MapLibre layer filter (trees + score + min trees + district). */
+  /** Overview: all qs_priority rows returned by summaries (not limited to map-visible filters). */
   const overviewQsStatistics = useMemo(() => {
-    const features = Array.isArray(qsMapGeojson?.features) ? qsMapGeojson.features : []
+    const features = Array.isArray(tunedQsMapGeojson?.features) ? tunedQsMapGeojson.features : []
     let totalTrees = 0
-    let count = 0
     for (const f of features) {
-      if (!featureMatchesScoreTreeMinFilters(f, mapControlFilterState)) continue
-      count += 1
       const p = f.properties || {}
       totalTrees += Number(p.tree_count ?? p.total_trees ?? 0) || 0
     }
     return {
-      total_quarter_sections: count,
+      total_quarter_sections: features.length,
       total_trees: totalTrees,
     }
-  }, [qsMapGeojson, mapControlFilterState])
+  }, [tunedQsMapGeojson])
 
   const displayStatistics = useMemo(() => {
     if (!summary?.statistics) return null
@@ -365,35 +559,48 @@ export default function MapDashboardPage() {
     }
   }, [summary, qsMapGeojson, overviewQsStatistics])
 
-  /** Quarter sections that need attention next: same filters as the map, sorted by normalized priority score (desc). */
+  /** All qs_priority rows for the pruning list (map sidebar filters do not apply here). */
   const pruningPriorityRows = useMemo(() => {
-    const features = Array.isArray(qsMapGeojson?.features) ? qsMapGeojson.features : []
+    const features = Array.isArray(tunedQsMapGeojson?.features) ? tunedQsMapGeojson.features : []
     const rows = []
     for (const f of features) {
-      if (!featureMatchesScoreTreeMinFilters(f, mapControlFilterState)) continue
       const p = f.properties || {}
       const qsId = qsIdFromFeatureProperties(p)
       if (!qsId) continue
-      const score = Number(p.Priority_Score_Normalized) || 0
+      const psComposite = Number(p._psCompositeDisplay ?? p.PS_composite) || 0
       const trees = Number(p.tree_count ?? p.total_trees ?? 0) || 0
+      const avgFromSummary = avgLastPrunedFromSummaryProperties(p)
       rows.push({
         qsId,
-        score,
+        psComposite,
         priorityLevel: String(p.priority_level ?? p._map_level ?? '').trim() || 'Low',
         district: String(p.district ?? 'Unknown'),
         treeCount: trees,
         topSpecies: String(p.top_species ?? 'Unknown'),
+        avgLastPruned: avgFromSummary ?? pruneQueueAvgLastPrunedByQsId[qsId] ?? null,
         centerLat: p.center_lat != null ? Number(p.center_lat) : null,
         centerLon: p.center_lon != null ? Number(p.center_lon) : null,
+        hasMapGeometry: Boolean(p.has_map_geometry),
         properties: p,
       })
     }
-    rows.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score
-      return a.qsId.localeCompare(b.qsId)
+    return enrichPruneQueueRowsWithPsMetrics(rows)
+  }, [tunedQsMapGeojson, pruneQueueAvgLastPrunedByQsId, priorityTuning])
+
+  const sortedPruningPriorityRows = useMemo(
+    () => sortPruneQueueRows(pruningPriorityRows, pruneQueueSort.key, pruneQueueSort.direction),
+    [pruningPriorityRows, pruneQueueSort],
+  )
+
+  const handlePruneQueueSort = (key) => {
+    setPruneQueueSort((prev) => {
+      if (prev.key === key) {
+        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' }
+      }
+      const defaultDesc = key === 'psComposite' || key === 'treeCount' || key === 'avgLastPruned'
+      return { key, direction: defaultDesc ? 'desc' : 'asc' }
     })
-    return rows
-  }, [qsMapGeojson, mapControlFilterState])
+  }
 
   const sidebarWidthPx = panelOpen ? 360 : 56
 
@@ -426,8 +633,8 @@ export default function MapDashboardPage() {
   }, [summary])
 
   const qsLabelGeojson = useMemo(
-    () => buildQsLabelPoints(qsMapGeojson ?? { type: 'FeatureCollection', features: [] }),
-    [qsMapGeojson]
+    () => buildQsLabelPoints(tunedQsMapGeojsonForMap ?? { type: 'FeatureCollection', features: [] }),
+    [tunedQsMapGeojsonForMap]
   )
 
   const treeGeojson = useMemo(() => {
@@ -666,6 +873,43 @@ export default function MapDashboardPage() {
     })
   }
 
+  async function fetchTreesForQsData(qs_id) {
+    if (!qs_id) return []
+
+    const cacheKey = `${qs_id}\t${QS_TREES_CLIENT_CACHE_TAG}`
+    const cached = treesCacheRef.current[cacheKey]
+    if (cached) return cached
+
+    if (!treesUrl.trim()) {
+      throw new Error('VITE_CF_GET_TREES_BY_QS_URL is not set in frontend/.env.')
+    }
+    if (!user) {
+      throw new Error('Sign in required.')
+    }
+
+    const token = await user.getIdToken()
+    const sep = treesUrl.includes('?') ? '&' : '?'
+    const url = `${treesUrl}${sep}qs_id=${encodeURIComponent(qs_id)}`
+    const res = await fetch(url, {
+      method: 'GET',
+      credentials: 'omit',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    const text = await res.text()
+    let json = null
+    try {
+      json = text ? JSON.parse(text) : null
+    } catch {
+      throw new Error(`Expected JSON; got HTTP ${res.status}: ${text.slice(0, 220)}`)
+    }
+    if (!res.ok) {
+      throw new Error(typeof json?.error === 'string' ? json.error : `Request failed (${res.status})`)
+    }
+    const trees = Array.isArray(json?.trees) ? json.trees : []
+    treesCacheRef.current = { ...treesCacheRef.current, [cacheKey]: trees }
+    return trees
+  }
+
   async function fetchTreesForQs(qs_id) {
     if (!qs_id) return
     setTreeFetchError('')
@@ -675,46 +919,22 @@ export default function MapDashboardPage() {
     if (cached) {
       setSelectedTrees(cached)
       setIsLoadingTrees(false)
-      return
-    }
-
-    if (!treesUrl.trim()) {
-      setTreeFetchError('VITE_CF_GET_TREES_BY_QS_URL is not set in frontend/.env.')
-      setSelectedTrees([])
-      setIsLoadingTrees(false)
-      return
-    }
-    if (!user) {
-      setTreeFetchError('Sign in required.')
-      setSelectedTrees([])
-      setIsLoadingTrees(false)
+      const avg = averageLastPrunedFromTrees(cached)
+      if (avg != null) {
+        setPruneQueueAvgLastPrunedByQsId((prev) => ({ ...prev, [qs_id]: avg }))
+      }
       return
     }
 
     setIsLoadingTrees(true)
     setSelectedTrees([])
     try {
-      const token = await user.getIdToken()
-      const sep = treesUrl.includes('?') ? '&' : '?'
-      const url = `${treesUrl}${sep}qs_id=${encodeURIComponent(qs_id)}`
-      const res = await fetch(url, {
-        method: 'GET',
-        credentials: 'omit',
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      const text = await res.text()
-      let json = null
-      try {
-        json = text ? JSON.parse(text) : null
-      } catch {
-        throw new Error(`Expected JSON; got HTTP ${res.status}: ${text.slice(0, 220)}`)
-      }
-      if (!res.ok) {
-        throw new Error(typeof json?.error === 'string' ? json.error : `Request failed (${res.status})`)
-      }
-      const trees = Array.isArray(json?.trees) ? json.trees : []
-      treesCacheRef.current = { ...treesCacheRef.current, [cacheKey]: trees }
+      const trees = await fetchTreesForQsData(qs_id)
       setSelectedTrees(trees)
+      const avg = averageLastPrunedFromTrees(trees)
+      if (avg != null) {
+        setPruneQueueAvgLastPrunedByQsId((prev) => ({ ...prev, [qs_id]: avg }))
+      }
     } catch (err) {
       setTreeFetchError(parseCloudFunctionError('Failed loading trees for this quarter section', err))
       setSelectedTrees([])
@@ -722,6 +942,37 @@ export default function MapDashboardPage() {
       setIsLoadingTrees(false)
     }
   }
+
+  useEffect(() => {
+    if (inventoryView !== 'prune-queue' || !user || !treesUrl.trim()) return
+    if (!Array.isArray(pruningPriorityRows) || pruningPriorityRows.length === 0) return
+
+    let cancelled = false
+    async function backfillMissingAvgLastPruned() {
+      const targets = pruningPriorityRows
+        .filter((row) => row.avgLastPruned == null && !pruneQueueBackfillRef.current.has(row.qsId))
+        .slice(0, PRUNE_QUEUE_METRICS_BACKFILL_LIMIT)
+
+      for (const row of targets) {
+        if (cancelled) return
+        pruneQueueBackfillRef.current.add(row.qsId)
+        try {
+          const trees = await fetchTreesForQsData(row.qsId)
+          const avg = averageLastPrunedFromTrees(trees)
+          if (avg != null && !cancelled) {
+            setPruneQueueAvgLastPrunedByQsId((prev) => ({ ...prev, [row.qsId]: avg }))
+          }
+        } catch {
+          // Ignore per-row failures; rankings still show other columns.
+        }
+      }
+    }
+
+    void backfillMissingAvgLastPruned()
+    return () => {
+      cancelled = true
+    }
+  }, [inventoryView, pruningPriorityRows, user, treesUrl])
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-surface text-on-surface">
@@ -778,7 +1029,7 @@ export default function MapDashboardPage() {
           <Source
             id={QS_SOURCE_ID}
             type="geojson"
-            data={qsMapGeojson ?? EMPTY_FEATURE_COLLECTION}
+            data={tunedQsMapGeojsonForMap ?? EMPTY_FEATURE_COLLECTION}
           >
             <Layer {...qsFillLayer} filter={qsMapLayerFilter} />
             <Layer {...qsLineLayer} filter={qsMapLayerFilter} />
@@ -835,47 +1086,116 @@ export default function MapDashboardPage() {
               <div className="mb-4">
                 <h1 className="text-lg font-bold text-slate-900">Pruning priority</h1>
                 <p className="mt-1 text-sm text-slate-600">
-                  Quarter sections ranked by normalized priority score (
-                  <code className="rounded bg-slate-200/80 px-1 text-xs">Priority_Score_Normalized</code>
-                  ), matching the map data service and{' '}
-                  <code className="rounded bg-slate-200/80 px-1 text-xs">qs_priority</code>. Uses the same
-                  filters as Map Controls.
+                  All quarter sections from <code className="rounded bg-slate-200/80 px-1 text-xs">qs_priority</code>,
+                  ranked by <strong>PS composite</strong>. Map colors use the same metric for sections with
+                  polygon geometry; sections without geometry appear here but not on the map.
                 </p>
               </div>
               {loadFinishedOk && pruningPriorityRows.length === 0 ? (
                 <div className="rounded-xl border border-slate-200 bg-white px-4 py-8 text-center text-sm text-slate-600">
-                  No quarter sections match the current filters. Adjust district, priority range, or minimum
-                  trees in the sidebar.
+                  No quarter sections loaded from summaries. Check that{' '}
+                  <code className="rounded bg-slate-100 px-1 text-xs">getQuarterSectionSummaries</code> is
+                  returning data.
                 </div>
               ) : (
                 <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
                   <div className="max-h-[calc(100vh-14rem)] overflow-auto">
-                    <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                    <table className="w-full min-w-[720px] border-collapse text-left text-sm">
                       <thead className="sticky top-0 z-10 border-b border-slate-200 bg-slate-100/95 backdrop-blur-sm">
                         <tr className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
                           <th className="px-3 py-3">#</th>
-                          <th className="px-3 py-3">Quarter section</th>
-                          <th className="px-3 py-3">Score</th>
-                          <th className="px-3 py-3">Level</th>
-                          <th className="px-3 py-3">District</th>
-                          <th className="px-3 py-3 text-right">Trees</th>
-                          <th className="px-3 py-3">Top species</th>
+                          <PruneQueueSortHeader
+                            label="Quarter section"
+                            columnKey="qsId"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
+                          <PruneQueueSortHeader
+                            label="PS composite"
+                            columnKey="psComposite"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
+                          <PruneQueueSortHeader
+                            label="Level"
+                            columnKey="priorityLevel"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
+                          <PruneQueueSortHeader
+                            label="District"
+                            columnKey="district"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
+                          <PruneQueueSortHeader
+                            label="Trees"
+                            columnKey="treeCount"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3 text-right"
+                          />
+                          <PruneQueueSortHeader
+                            label="Top species"
+                            columnKey="topSpecies"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
+                          <PruneQueueSortHeader
+                            label="Avg last pruned"
+                            columnKey="avgLastPruned"
+                            activeKey={pruneQueueSort.key}
+                            direction={pruneQueueSort.direction}
+                            onSort={handlePruneQueueSort}
+                            className="px-3 py-3"
+                          />
                           <th className="px-3 py-3 w-32"> </th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 text-slate-800">
-                        {pruningPriorityRows.map((row, i) => (
+                        {sortedPruningPriorityRows.map((row, i) => (
                           <tr key={row.qsId} className="hover:bg-slate-50/80">
                             <td className="whitespace-nowrap px-3 py-2.5 text-slate-500">{i + 1}</td>
                             <td className="px-3 py-2.5 font-semibold text-slate-900">{row.qsId}</td>
-                            <td className="whitespace-nowrap px-3 py-2.5 font-mono tabular-nums">
-                              {row.score.toFixed(1)}
+                            <td className="whitespace-nowrap px-3 py-2.5">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+                                  style={{
+                                    backgroundColor: colorFromScore(
+                                      row.psComposite,
+                                      scoreBounds.min,
+                                      scoreBounds.max,
+                                    ),
+                                  }}
+                                  title={`PS ${formatPsComposite(row.psComposite)} (map color scale)`}
+                                />
+                                <div>
+                                  <div className="font-mono tabular-nums text-slate-900">
+                                    {formatPsComposite(row.psComposite)}
+                                  </div>
+                                  <div className="text-[10px] tabular-nums text-slate-400">
+                                    P{Number(row.psPercentile || 0).toFixed(0)} in list
+                                  </div>
+                                </div>
+                              </div>
                             </td>
                             <td className="px-3 py-2.5">
                               <span
-                                className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-bold ${priorityLevelBadgeClass(row.priorityLevel)}`}
+                                className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-bold ${priorityLevelBadgeClass(row.relativeLevel ?? row.priorityLevel)}`}
                               >
-                                {row.priorityLevel}
+                                {row.relativeLevel ?? row.priorityLevel}
                               </span>
                             </td>
                             <td className="px-3 py-2.5 text-slate-700">{row.district}</td>
@@ -883,14 +1203,25 @@ export default function MapDashboardPage() {
                             <td className="max-w-[180px] truncate px-3 py-2.5 text-slate-600" title={row.topSpecies}>
                               {row.topSpecies}
                             </td>
+                            <td className="whitespace-nowrap px-3 py-2.5 tabular-nums text-slate-700">
+                              {formatAvgLastPruned(row.avgLastPruned)}
+                            </td>
                             <td className="px-3 py-2.5">
-                              <button
-                                type="button"
-                                className="rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white transition-colors hover:bg-indigo-700"
-                                onClick={() => focusQsFromPruningQueue(row)}
-                              >
-                                Map
-                              </button>
+                              {row.hasMapGeometry !== false &&
+                              Number.isFinite(row.centerLat) &&
+                              Number.isFinite(row.centerLon) ? (
+                                <button
+                                  type="button"
+                                  className="rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white transition-colors hover:bg-indigo-700"
+                                  onClick={() => focusQsFromPruningQueue(row)}
+                                >
+                                  Map
+                                </button>
+                              ) : (
+                                <span className="text-xs text-slate-400" title="No polygon geometry for this quarter section">
+                                  No map
+                                </span>
+                              )}
                             </td>
                           </tr>
                         ))}
@@ -1020,29 +1351,37 @@ export default function MapDashboardPage() {
 
               <section className="space-y-4">
                 <h3 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100 pb-2">
-                  Priority Score
+                  PS composite
                 </h3>
                 <div>
                   <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase mb-3">
-                    <span>Min: {priorityMin}</span>
-                    <span>Max: {priorityMax}</span>
+                    <span>Min: {formatPsComposite(psMin)}</span>
+                    <span>Max: {formatPsComposite(psMax)}</span>
                   </div>
                   <div className="space-y-4">
                     <input
                       className="w-full accent-indigo-600 h-1.5 bg-slate-200 rounded-full appearance-none cursor-pointer"
                       type="range"
-                      min={0}
-                      max={100}
-                      value={priorityMin}
-                      onChange={(e) => setPriorityMin(Number(e.target.value))}
+                      min={psFilterBounds.min}
+                      max={psFilterBounds.max}
+                      step={psFilterBounds.step}
+                      value={Math.min(Math.max(psMin, psFilterBounds.min), psFilterBounds.max)}
+                      onChange={(e) => {
+                        const next = Number(e.target.value)
+                        setPsMin(Math.min(next, psMax))
+                      }}
                     />
                     <input
                       className="w-full accent-indigo-600 h-1.5 bg-slate-200 rounded-full appearance-none cursor-pointer"
                       type="range"
-                      min={0}
-                      max={100}
-                      value={priorityMax}
-                      onChange={(e) => setPriorityMax(Number(e.target.value))}
+                      min={psFilterBounds.min}
+                      max={psFilterBounds.max}
+                      step={psFilterBounds.step}
+                      value={Math.min(Math.max(psMax, psFilterBounds.min), psFilterBounds.max)}
+                      onChange={(e) => {
+                        const next = Number(e.target.value)
+                        setPsMax(Math.max(next, psMin))
+                      }}
                     />
                   </div>
                 </div>
@@ -1083,13 +1422,19 @@ export default function MapDashboardPage() {
                 </label>
               </section>
 
+              <PriorityTuningPanel
+                tuning={priorityTuning}
+                onTuningChange={setPriorityTuning}
+                breakdown={priorityFactorBreakdown}
+              />
+
             </div>
           )}
         </div>
         {/* --- END REFACTORED FLUSH LEFT SIDEBAR --- */}
 
         {selectedQs ? (
-          <div className="absolute right-4 top-4 z-[1000] w-[340px] max-w-[calc(100vw-2rem)] rounded-xl border border-white/30 bg-white/70 p-4 text-sm text-slate-700 shadow-xl backdrop-blur-md">
+          <div className="absolute right-4 top-4 z-[1000] w-[min(400px,calc(100vw-2rem))] max-h-[calc(100vh-6rem)] overflow-y-auto rounded-xl border border-white/30 bg-white/70 p-4 text-sm text-slate-700 shadow-xl backdrop-blur-md [scrollbar-width:thin]">
             <div className="mb-2 flex items-center justify-between gap-2">
               <h3 className="text-sm font-bold text-slate-900">
                 Quarter Section {selectedQs.qs_id ?? selectedQs.QTRSEC ?? selectedQs.quarter_section ?? 'N/A'}
@@ -1124,71 +1469,19 @@ export default function MapDashboardPage() {
             </div>
             {qsDetailsExpanded ? (
               <>
-                <p>
-                  <strong>Priority Score:</strong>{' '}
-                  {Number(selectedQs.Priority_Score_Normalized || 0).toFixed(1)}
-                </p>
-                <p>
-                  <strong>Average DBH:</strong>{' '}
-                  {displayAverageDbh != null ? `${displayAverageDbh.toFixed(1)}"` : '—'}
-                </p>
-                <p>
-                  <strong>Composite Priority:</strong> {Number(selectedQs.PS_composite || 0).toFixed(2)}
-                </p>
-                <p>
-                  <strong>District:</strong> {selectedQs.district || 'N/A'}
-                </p>
-
-                {isLoadingTrees || treeFetchError ? (
-                  <div className="mt-3 rounded-md border border-slate-200 bg-white/70 px-3 py-2 text-xs">
-                    {isLoadingTrees ? 'Loading trees for this quarter section...' : null}
-                    {!isLoadingTrees && treeFetchError ? (
-                      <span className="text-red-700">{treeFetchError}</span>
-                    ) : null}
-                  </div>
-                ) : null}
-                {!isLoadingTrees && !treeFetchError ? (
-                  <>
-                    {shapExplanationUrl.trim() ? (
-                      <div className="mt-2 rounded-md border border-slate-200 bg-white/70 p-3 text-xs text-slate-700">
-                        <div className="mb-2 font-semibold text-slate-800">Priority Explanation</div>
-                        {!focusedTreeSiteId ? (
-                          <p className="text-slate-500">
-                            Select a tree on the map to view its Priority Explanation.
-                          </p>
-                        ) : shapExplanationQuery.isPending ? (
-                          <div className="flex items-center gap-2 text-slate-500">
-                            <span
-                              className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-600"
-                              aria-hidden
-                            />
-                            <span>Loading priority explanation…</span>
-                          </div>
-                        ) : shapExplanationQuery.isError ? (
-                          <p className="text-red-700">
-                            {parseCloudFunctionError(
-                              'Could not load priority explanation',
-                              shapExplanationQuery.error
-                            )}
-                          </p>
-                        ) : shapExplanationQuery.data ? (
-                          <p className="leading-relaxed text-slate-800">{shapExplanationQuery.data}</p>
-                        ) : (
-                          <p className="text-slate-500">
-                            No priority explanation available for this tree.
-                          </p>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="mt-2 rounded-md border border-slate-200 bg-white/70 p-3 text-xs text-slate-700">
-                        <p className="text-slate-500">
-                          Priority explanation URL is not configured (set
-                          VITE_CF_GET_TREE_SHAP_EXPLANATION_URL).
-                        </p>
-                      </div>
-                    )}
-                  </>
-                ) : null}
+                <div className="mb-2 font-semibold text-slate-800">Inventory insights</div>
+                <InventoryInsightPanel
+                  selectedQs={selectedQs}
+                  selectedTrees={selectedTrees}
+                  displayAverageDbh={displayAverageDbh}
+                  isLoadingTrees={isLoadingTrees}
+                  treeFetchError={treeFetchError}
+                  focusedTreeSiteId={focusedTreeSiteId}
+                  shapQuery={shapExplanationQuery}
+                  shapConfigured={Boolean(shapExplanationUrl.trim())}
+                  formatError={parseCloudFunctionError}
+                  priorityLevelBadgeClass={priorityLevelBadgeClass}
+                />
               </>
             ) : (
               <div className="rounded-md border border-slate-200 bg-white/70 px-3 py-2 text-xs text-slate-600">

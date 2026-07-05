@@ -22,4 +22,8 @@ export const mapApiEnv = {
   userTasksUrl: String(import.meta.env.VITE_CF_USER_TASKS_API_URL || '').trim(),
   /** Optional trees_core CRUD (same Firebase codebase as map summaries; deploy `treesDataApi`). */
   treesDataUrl: String(import.meta.env.VITE_CF_TREES_DATA_API_URL || '').trim(),
+  /** User registration + approval workflow (`accessApi`). */
+  accessApiUrl: String(import.meta.env.VITE_CF_ACCESS_API_URL || '').trim(),
+  /** GET ?scope=quarter_section|district&qs_id=&district=&from=&to= → priority score history. */
+  priorityHistoryUrl: String(import.meta.env.VITE_CF_GET_PRIORITY_HISTORY_URL || '').trim(),
 }

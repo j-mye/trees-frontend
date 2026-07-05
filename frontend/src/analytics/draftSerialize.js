@@ -22,7 +22,13 @@ export function serializeDraftQuery(draftSlice) {
   const cf = draftSlice.colorItem?.id ?? ''
   const ct = draftSlice.chartType
   const filters = [...draftSlice.draftFilters]
-    .map((f) => `${f.fieldId}:${f.op}:${f.value}`)
+    .map((f) => {
+      if (f.op === 'in') {
+        const vals = Array.isArray(f.values) && f.values.length ? f.values : String(f.value || '').split(/[|,]/)
+        return `${f.fieldId}:${f.op}:${vals.map((v) => String(v).trim()).filter(Boolean).sort().join(',')}`
+      }
+      return `${f.fieldId}:${f.op}:${f.value ?? ''}`
+    })
     .sort()
     .join('|')
   return JSON.stringify({ xf, yf, ya, cf, ct, filters })

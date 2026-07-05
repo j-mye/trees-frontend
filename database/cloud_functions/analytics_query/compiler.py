@@ -10,9 +10,17 @@ import re
 from typing import Any
 
 # Mirrors frontend/src/analytics/fieldCatalog.js
-DIMENSION_TO_COLUMN: dict[str, str] = {
-    "dim-species": "top_species",
+FILTER_TO_COLUMN: dict[str, str] = {
+    "filter-quarter-section": "qs_id",
+    "filter-district": "district",
+    # legacy persisted ids
+    "dim-quarter-section": "qs_id",
     "dim-district": "district",
+}
+
+DIMENSION_TO_COLUMN: dict[str, str] = {
+    "dim-quarter-section": "qs_id",
+    "dim-species": "top_species",
     "dim-priority-level": "priority_level",
     "dim-inspection-year": "inspection_year",
     "dim-tree-status": "tree_status",
@@ -34,7 +42,7 @@ MEASURE_TO_COLUMN: dict[str, str] = {
 }
 
 AGG_FUNCS = frozenset({"SUM", "AVG", "COUNT", "MAX"})
-FILTER_OPS = frozenset({"eq", "gt", "gte", "lt", "lte"})
+FILTER_OPS = frozenset({"eq", "in", "gt", "gte", "lt", "lte"})
 
 
 def _safe_ident(name: str) -> str:
@@ -44,7 +52,11 @@ def _safe_ident(name: str) -> str:
 
 
 def _assert_allowed_column(col: str) -> str:
-    allowed = set(DIMENSION_TO_COLUMN.values()) | set(MEASURE_TO_COLUMN.values())
+    allowed = (
+        set(FILTER_TO_COLUMN.values())
+        | set(DIMENSION_TO_COLUMN.values())
+        | set(MEASURE_TO_COLUMN.values())
+    )
     if col not in allowed:
         raise ValueError(f"Column not in allowlist: {col!r}")
     return _safe_ident(col)
@@ -116,11 +128,26 @@ def compile_draft_to_sql(draft: dict[str, Any], *, table_fqn: str) -> tuple[str,
         value = raw_filter.get("value")
         if not field_id or op not in FILTER_OPS:
             continue
-        filter_col = DIMENSION_TO_COLUMN.get(field_id) or MEASURE_TO_COLUMN.get(field_id)
+        filter_col = (
+            FILTER_TO_COLUMN.get(field_id)
+            or DIMENSION_TO_COLUMN.get(field_id)
+            or MEASURE_TO_COLUMN.get(field_id)
+        )
         if not filter_col:
             raise ValueError(f"Unknown filter field id {field_id!r}")
         safe_filter_col = _assert_allowed_column(filter_col)
         p_name = f"f_{i}"
+        if op == "in":
+            raw_values = raw_filter.get("values")
+            if isinstance(raw_values, list) and raw_values:
+                values = [str(v).strip() for v in raw_values if str(v).strip()]
+            else:
+                values = [v.strip() for v in str(value or "").replace("|", ",").split(",") if v.strip()]
+            if not values:
+                continue
+            where_parts.append(f"{_normalize_dimension_expr(safe_filter_col)} IN UNNEST(@{p_name})")
+            params.append({"name": p_name, "type": "ARRAY<STRING>", "value": values})
+            continue
         if op == "eq":
             n = _number_or_none(value)
             if n is not None:

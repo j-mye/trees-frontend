@@ -59,6 +59,7 @@ function ChartToggleButton({ t, icon, label, chartType, onChartType, allowedChar
  * @param {(t: import('../types.js').ChartType) => void} props.onChartType
  * @param {import('../types.js').ChartType[]} props.allowedChartTypes
  * @param {(t: import('../types.js').ChartType) => string | undefined} props.chartDisabledReason
+ * @param {string} [props.chartTitle]
  * @param {string} props.xAxisTitle
  * @param {string} props.yAxisTitle
  * @param {string} props.loadError
@@ -67,6 +68,9 @@ function ChartToggleButton({ t, icon, label, chartType, onChartType, allowedChar
  * @param {() => void} props.onFullscreen
  * @param {() => void} props.onExportCsv
  * @param {boolean} props.exportDisabled
+ * @param {boolean} [props.dataLoading]
+ * @param {boolean} [props.runAttempted]
+ * @param {boolean} [props.runIsEmpty]
  * @param {{
  *   rowsReturned: number
  *   chartMaxPoints: number
@@ -82,6 +86,7 @@ export function CanvasPane({
   onChartType,
   allowedChartTypes,
   chartDisabledReason,
+  chartTitle = '',
   xAxisTitle,
   yAxisTitle,
   loadError,
@@ -91,13 +96,16 @@ export function CanvasPane({
   onExportCsv,
   exportDisabled,
   resultMeta = null,
+  dataLoading = false,
+  runAttempted = false,
+  runIsEmpty = false,
 }) {
   const [tableOpen, setTableOpen] = useState(false)
 
   return (
     <section
       ref={canvasSectionRef}
-      className="relative flex min-h-0 w-[55%] min-w-0 flex-col overflow-hidden bg-surface-dim/30"
+      className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-surface-dim/30"
     >
       <div className={`${canvasScrollArea} flex flex-col`}>
         <div className="flex min-h-0 min-w-0 flex-1 flex-col items-stretch gap-4 px-4 py-6">
@@ -112,19 +120,50 @@ export function CanvasPane({
               <>
                 <div className="pointer-events-none absolute inset-0 z-0 bg-[radial-gradient(circle_at_20%_30%,#4c56af_0%,transparent_50%),radial-gradient(circle_at_80%_70%,#4c56af_0%,transparent_50%)] opacity-5" />
                 <div className="relative z-0 flex min-h-[280px] flex-col items-center justify-center gap-4 px-6 text-center">
-                  <span
-                    className="material-symbols-outlined select-none text-primary"
-                    style={{ fontSize: 48, width: 48, height: 48, lineHeight: 1 }}
-                    aria-hidden
-                  >
-                    bar_chart
-                  </span>
-                  <div className="flex max-w-md flex-col items-center gap-2">
-                    <h2 className="text-xl !font-bold !text-primary">Design Your Visualization</h2>
-                    <p className="text-sm leading-relaxed text-slate-600">
-                      {`Drag dimensions and measures from the data dictionary into the builder, then click 'Run Query' to generate your chart.`}
-                    </p>
-                  </div>
+                  {dataLoading ? (
+                    <>
+                      <span
+                        className="material-symbols-outlined animate-spin select-none text-primary"
+                        style={{ fontSize: 40, width: 40, height: 40, lineHeight: 1 }}
+                        aria-hidden
+                      >
+                        refresh
+                      </span>
+                      <p className="text-sm text-slate-500">Loading Milwaukee tree data…</p>
+                    </>
+                  ) : runIsEmpty ? (
+                    <>
+                      <span
+                        className="material-symbols-outlined select-none text-amber-500"
+                        style={{ fontSize: 40, width: 40, height: 40, lineHeight: 1 }}
+                        aria-hidden
+                      >
+                        filter_alt_off
+                      </span>
+                      <div className="flex max-w-sm flex-col items-center gap-2">
+                        <h2 className="text-lg !font-bold !text-on-surface">No data found</h2>
+                        <p className="text-sm leading-relaxed text-slate-500">
+                          No results matched your current filters. Try removing a filter or selecting a broader area.
+                        </p>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <span
+                        className="material-symbols-outlined select-none text-primary"
+                        style={{ fontSize: 48, width: 48, height: 48, lineHeight: 1 }}
+                        aria-hidden
+                      >
+                        bar_chart
+                      </span>
+                      <div className="flex max-w-sm flex-col items-center gap-2">
+                        <h2 className="text-xl !font-bold !text-primary">Your chart will appear here</h2>
+                        <p className="text-sm leading-relaxed text-slate-500">
+                          Choose a group-by and measure on the left, then click <strong>Generate Chart</strong>.
+                        </p>
+                      </div>
+                    </>
+                  )}
                 </div>
               </>
             ) : (
@@ -138,8 +177,19 @@ export function CanvasPane({
                     </span>
                   </div>
                 ) : null}
+                {chartTitle ? (
+                  <h2 className="mb-2 shrink-0 px-1 text-center text-sm font-bold leading-snug text-on-surface">
+                    {chartTitle}
+                  </h2>
+                ) : null}
                 <div className="min-h-0 min-w-0 flex-1">
-                  <ChartPreview chartType={chartType} rows={rows} xAxisTitle={xAxisTitle} yAxisTitle={yAxisTitle} />
+                  <ChartPreview
+                    chartType={chartType}
+                    rows={rows}
+                    chartTitle={chartTitle}
+                    xAxisTitle={xAxisTitle}
+                    yAxisTitle={yAxisTitle}
+                  />
                 </div>
               </div>
             )}
@@ -244,17 +294,19 @@ export function CanvasPane({
       </div>
 
       <div className="flex shrink-0 items-end justify-between border-t border-outline-variant/10 bg-surface-dim/30 p-6">
-        <div className="space-y-1">
-          <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant opacity-60">Status</span>
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <div className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-              <span className="text-xs font-medium text-on-surface">Engine Ready</span>
+        {loadError || runError ? (
+          <div className="min-w-0 flex-1 space-y-1 pr-4">
+            <span className="text-[10px] font-black uppercase tracking-widest text-on-surface-variant opacity-60">
+              Status
+            </span>
+            <div className="flex flex-col gap-1">
+              {loadError ? <span className="text-xs text-red-700">{loadError}</span> : null}
+              {runError ? <span className="text-xs text-red-700">{runError}</span> : null}
             </div>
-            {loadError ? <span className="text-xs text-red-700">{loadError}</span> : null}
-            {runError ? <span className="text-xs text-red-700">{runError}</span> : null}
           </div>
-        </div>
+        ) : (
+          <div className="flex-1" />
+        )}
         <div className="flex gap-2">
           <button
             type="button"

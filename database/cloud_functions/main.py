@@ -23,6 +23,7 @@ import re
 import time
 import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 from urllib.parse import parse_qs
 
@@ -49,6 +50,10 @@ def _load_dotenv_files() -> None:
         path = os.path.join(_BASE_DIR, name)
         if os.path.isfile(path):
             load_dotenv(path, override=False)
+    # Optional fallback: database/.env (teams often set ACCESS_* there by mistake).
+    parent_env = os.path.join(_BASE_DIR, "..", ".env")
+    if os.path.isfile(parent_env):
+        load_dotenv(parent_env, override=False)
 
 
 _load_dotenv_files()
@@ -70,6 +75,7 @@ from firebase_functions.options import set_global_options
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+import access_control as ac
 import cached_http
 
 set_global_options(max_instances=10)
@@ -294,6 +300,36 @@ def _verify_firebase_user(req: https_fn.Request) -> dict[str, Any] | None:
         return None
 
 
+def _require_approved_claims(
+    req: https_fn.Request,
+) -> tuple[dict[str, Any] | None, https_fn.Response | None]:
+    """Verify Firebase token and (when enabled) BigQuery approval_status=approved."""
+    claims = _verify_firebase_user(req)
+    if claims is None:
+        return None, _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    if not ac.access_require_approval_enabled():
+        return claims, None
+    cfg = bigquery_config_from_environ()
+    client = _bigquery_client(cfg)
+    claims_out, err_payload = ac.enforce_approved_access(
+        claims,
+        cfg=cfg,
+        client=client,
+        table_ref_fn=_table_ref,
+        run_query_fn=_run_query,
+    )
+    if err_payload:
+        return None, _json_response(req, err_payload, status=403)
+    return claims_out, None
+
+
 def _cors_headers(req: https_fn.Request) -> dict[str, str]:
     """Build CORS response headers (safe if ``req`` or ``headers`` is unusual)."""
     origin = ""
@@ -445,12 +481,13 @@ def _bq_config_cache_fingerprint(cfg: BigQueryEnvConfig) -> str:
 def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
     """
     Expects refactored operational schema:
-    - quarter_sections (qs_id, district, geometry)
-    - qs_priority (PS_* fields, Priority_Score_Normalized)
-    - trees_core (dbh, qs_id)
+    - qs_priority (driver: authoritative qs_id list + PS_* / Priority_Score_Normalized)
+    - quarter_sections (LEFT JOIN: OBJECTID, district, geometry)
+    - trees_core (dbh, qs_id) aggregated in tree_stats
     """
     qs_t = _table_ref(cfg.qs_table_fqn)
     tree_t = _table_ref(cfg.trees_table_fqn)
+    tf_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.trees_features")
     qsp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.qs_priority")
     sp_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.species")
     id_col = cfg.qs_join_column
@@ -473,15 +510,37 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
               AS INT64
             )
           ) AS STRING
-        ) AS inspection_year
+        ) AS inspection_year,
+        AVG(
+          NULLIF(
+            GREATEST(
+              COALESCE(SAFE_CAST(t.last_pruned AS FLOAT64), 0),
+              COALESCE(
+                SAFE_CAST(
+                  REGEXP_EXTRACT(CAST(t.last_pruned AS STRING), r'(19\\d{{2}}|20\\d{{2}})')
+                  AS FLOAT64
+                ),
+                0
+              )
+            ),
+            0
+          )
+        ) AS avg_last_pruned,
+        AVG(SAFE_CAST(tf.`I_f` AS FLOAT64)) AS avg_i_f,
+        AVG(SAFE_CAST(tf.p_f AS FLOAT64)) AS avg_p_f,
+        AVG(SAFE_CAST(tf.a_p AS FLOAT64)) AS avg_a_p,
+        AVG(SAFE_CAST(tf.risk_term_k1_I_f_p_f_b AS FLOAT64)) AS avg_risk_term,
+        AVG(SAFE_CAST(tf.age_term_k3_a_p AS FLOAT64)) AS avg_age_term
       FROM {tree_t} AS t
+      LEFT JOIN {tf_t} AS tf
+        ON TRIM(CAST(t.tree_id AS STRING)) = TRIM(CAST(tf.tree_id AS STRING))
       LEFT JOIN {sp_t} s
         ON t.species_id = s.species_id
       GROUP BY clean_site_id
     )
     SELECT
       CAST(qs.OBJECTID AS INT64) AS qs_objectid,
-      TRIM(CAST(qs.{id_col} AS STRING)) AS qs_id,
+      TRIM(CAST(qsp.qs_id AS STRING)) AS qs_id,
       CAST(qsp.PS_critical AS FLOAT64) AS ps_critical,
       CAST(qsp.PS_bottom90 AS FLOAT64) AS ps_bottom90,
       CAST(qsp.PS_background AS FLOAT64) AS ps_background,
@@ -492,16 +551,31 @@ def _summaries_sql(cfg: BigQueryEnvConfig) -> str:
       CAST(COALESCE(ts.avg_dbh, 0.0) AS FLOAT64) AS avg_dbh,
       CAST(COALESCE(ts.top_species, "Unknown") AS STRING) AS top_species,
       CAST(COALESCE(ts.inspection_year, "Unknown") AS STRING) AS inspection_year,
+      ts.avg_last_pruned AS avg_last_pruned,
+      ts.avg_i_f AS avg_i_f,
+      ts.avg_p_f AS avg_p_f,
+      ts.avg_a_p AS avg_a_p,
+      ts.avg_risk_term AS avg_risk_term,
+      ts.avg_age_term AS avg_age_term,
+      CAST(qsp.critical_weight AS FLOAT64) AS critical_weight,
+      CAST(qsp.k AS FLOAT64) AS qs_k,
       CAST(COALESCE(qs.district, "Unknown") AS STRING) AS district,
       CAST(qs.{gcol} AS STRING) AS geom_json,
-      ST_X(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))) AS center_lon,
-      ST_Y(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))) AS center_lat
-    FROM {qs_t} qs
-    LEFT JOIN {qsp_t} qsp
-      ON TRIM(CAST(qs.{id_col} AS STRING)) = TRIM(CAST(qsp.qs_id AS STRING))
+      IF(
+        qs.{gcol} IS NOT NULL AND TRIM(CAST(qs.{gcol} AS STRING)) != '',
+        ST_X(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))),
+        NULL
+      ) AS center_lon,
+      IF(
+        qs.{gcol} IS NOT NULL AND TRIM(CAST(qs.{gcol} AS STRING)) != '',
+        ST_Y(ST_CENTROID(ST_GEOGFROMGEOJSON(qs.{gcol}))),
+        NULL
+      ) AS center_lat
+    FROM {qsp_t} qsp
+    LEFT JOIN {qs_t} qs
+      ON TRIM(CAST(qsp.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
     LEFT JOIN tree_stats ts
-      ON TRIM(CAST(qs.{id_col} AS STRING)) = ts.clean_site_id
-    WHERE qs.{gcol} IS NOT NULL
+      ON TRIM(CAST(qsp.qs_id AS STRING)) = ts.clean_site_id
     """
 
 
@@ -513,24 +587,27 @@ def _trees_sql(cfg: BigQueryEnvConfig) -> str:
     SELECT
       CAST(t.qs_id AS STRING) AS qs_id,
       CAST(t.tree_id AS STRING) AS tree_id,
+      CAST(t.site_id AS STRING) AS site_id,
       CAST(t.latitude AS FLOAT64) AS lat,
       CAST(t.longitude AS FLOAT64) AS lon,
       CAST(t.dbh AS FLOAT64) AS dbh,
       SAFE_CAST(t.height AS FLOAT64) AS height,
       CAST(COALESCE(CAST(t.condition_aerial AS STRING), "Unknown") AS STRING) AS condition_aerial,
       CAST(COALESCE(s.simple_species, s.full_name, s.scientific_name, "Unknown") AS STRING) AS species,
-      CAST(tf.priority_score AS FLOAT64) AS priority_score,
-      CAST(tf.risk_term_k1_I_f_p_f_b AS FLOAT64) AS risk_term_k1_I_f_p_f_b,
-      CAST(tf.age_term_k3_a_p AS FLOAT64) AS age_term_k3_a_p,
+      SAFE_CAST(tf.priority_score AS FLOAT64) AS priority_score,
+      SAFE_CAST(tf.`I_f` AS FLOAT64) AS i_f,
+      SAFE_CAST(tf.`p_f` AS FLOAT64) AS p_f,
+      SAFE_CAST(tf.a_p AS FLOAT64) AS a_p,
       CAST(t.age AS FLOAT64) AS age,
       CAST(t.maintenance_deficit AS INT64) AS maintenance_deficit,
       CAST(t.years_since_pruned AS INT64) AS years_since_pruned,
+      SAFE_CAST(t.last_pruned AS FLOAT64) AS last_pruned,
       CAST(t.can_strike_building AS BOOL) AS can_strike_building,
       CAST(t.crown_diameter_m AS FLOAT64) AS crown_diameter_m,
       CAST(COALESCE(CAST(t.missing_or_dead AS STRING), "") AS STRING) AS missing_or_dead
     FROM {t} AS t
     LEFT JOIN {tf} AS tf
-      ON CAST(t.tree_id AS STRING) = CAST(tf.tree_id AS STRING)
+      ON TRIM(CAST(t.tree_id AS STRING)) = TRIM(CAST(tf.tree_id AS STRING))
     LEFT JOIN {sp} AS s
       ON t.species_id = s.species_id
     WHERE TRIM(CAST(t.qs_id AS STRING)) = TRIM(@qs_id)
@@ -625,8 +702,6 @@ def _summaries_payload_from_bigquery(
     features: list[dict[str, Any]] = []
     for row in rows:
         geom = _geometry_from_bq_value(row["geom_json"])
-        if geom is None:
-            continue
         ps_critical = float(row["ps_critical"] or 0.0)
         ps_bottom90 = float(row["ps_bottom90"] or 0.0)
         ps_background = float(row["ps_background"] or 0.0)
@@ -634,8 +709,10 @@ def _summaries_payload_from_bigquery(
         priority_score_normalized = float(row["priority_score_normalized"] or 0.0)
         qs = str(row["qs_id"])
         tt = int(row["total_trees"] or 0)
-        clat = float(row["center_lat"] or 0.0)
-        clon = float(row["center_lon"] or 0.0)
+        clat_raw = row.get("center_lat")
+        clon_raw = row.get("center_lon")
+        clat = float(clat_raw) if clat_raw is not None else None
+        clon = float(clon_raw) if clon_raw is not None else None
         avg_dbh = float(row["avg_dbh"] or 0.0)
         feature = {
             "type": "Feature",
@@ -654,10 +731,19 @@ def _summaries_payload_from_bigquery(
                 "priority_level": _priority_level_from_score(priority_score_normalized),
                 "top_species": str(row["top_species"] or "Unknown"),
                 "inspection_year": str(row["inspection_year"] or "Unknown"),
+                "avg_last_pruned": _optional_float_for_json(row.get("avg_last_pruned")),
+                "avg_i_f": _optional_float_for_json(row.get("avg_i_f")),
+                "avg_p_f": _optional_float_for_json(row.get("avg_p_f")),
+                "avg_a_p": _optional_float_for_json(row.get("avg_a_p")),
+                "avg_risk_term": _optional_float_for_json(row.get("avg_risk_term")),
+                "avg_age_term": _optional_float_for_json(row.get("avg_age_term")),
+                "critical_weight": _optional_float_for_json(row.get("critical_weight")),
+                "qs_k": _optional_float_for_json(row.get("qs_k")),
                 "center_lat": clat,
                 "center_lon": clon,
                 "district": str(row["district"] or "Unknown"),
                 "avg_dbh": avg_dbh,
+                "has_map_geometry": geom is not None,
             },
             "geometry": geom,
         }
@@ -688,6 +774,23 @@ def _optional_float_for_json(v: Any) -> float | None:
     return x
 
 
+def _metric_from_bq_row(row: Any, *field_names: str) -> float | None:
+    """Read first present numeric column from a BigQuery row (alias or source name)."""
+    for field in field_names:
+        val = None
+        try:
+            val = row.get(field)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            try:
+                val = row[field]
+            except (KeyError, TypeError, IndexError):
+                continue
+        out = _optional_float_for_json(val)
+        if out is not None:
+            return out
+    return None
+
+
 def _trees_payload_from_bigquery(
     qs_id: str, cfg: BigQueryEnvConfig, client: bigquery.Client
 ) -> dict[str, Any]:
@@ -715,12 +818,15 @@ def _trees_payload_from_bigquery(
                 "quarter_section": str(row["qs_id"] or qs_id),
                 "tree_id": str(row["tree_id"] or ""),
                 "tree_row_id": str(row["tree_id"] or ""),
-                "priority_score": float(row["priority_score"] or 0.0),
-                "risk_term_k1_I_f_p_f_b": float(row["risk_term_k1_I_f_p_f_b"] or 0.0),
-                "age_term_k3_a_p": float(row["age_term_k3_a_p"] or 0.0),
+                "site_id": str(row["site_id"] or ""),
+                "priority_score": _metric_from_bq_row(row, "priority_score") or 0.0,
+                "i_f": _metric_from_bq_row(row, "i_f", "I_f"),
+                "p_f": _metric_from_bq_row(row, "p_f", "P_f"),
+                "a_p": _metric_from_bq_row(row, "a_p"),
                 "age": float(row["age"]) if row["age"] is not None else 0.0,
                 "maintenance_deficit": int(row["maintenance_deficit"] or 0),
                 "years_since_pruned": int(row["years_since_pruned"] or 0),
+                "last_pruned": _metric_from_bq_row(row, "last_pruned"),
                 "can_strike_building": bool(row["can_strike_building"])
                 if row["can_strike_building"] is not None
                 else False,
@@ -734,10 +840,12 @@ def _trees_payload_from_bigquery(
 
 
 _SUMMARIES_TTL_SECONDS = 86400
+# Bump when getQuarterSectionSummaries SELECT / GeoJSON properties change (invalidates json_cache).
+_SUMMARIES_PAYLOAD_CACHE_REVISION = "v5-all-qs-priority-rows"
 _TREES_TTL_SECONDS = 86400
 _SHAP_EXPLANATION_TTL_SECONDS = 86400
 # Bump when getTreesByQs SELECT / per-tree JSON shape changes (invalidates in-memory json_cache).
-_TREES_PAYLOAD_CACHE_REVISION = "new-schema-v1"
+_TREES_PAYLOAD_CACHE_REVISION = "new-schema-v6-site-id"
 
 
 def _safe_shap_site_id_column(raw: str) -> str:
@@ -772,7 +880,23 @@ def _shap_table_fqn_from_cfg(cfg: BigQueryEnvConfig) -> str:
 
 def _shap_http_cache_fingerprint(cfg: BigQueryEnvConfig) -> str:
     site_col = _safe_shap_site_id_column(_env("BQ_SHAP_SITE_ID_COLUMN") or "Site ID")
-    return "|".join((_shap_table_fqn_from_cfg(cfg), site_col, cfg.location, cfg.project_id))
+    return "|".join((_shap_table_fqn_from_cfg(cfg), site_col, cfg.location, cfg.project_id, "shap-v3-site-id"))
+
+
+_SHAP_CONTRIBUTION_SKIP_COLUMNS = frozenset(
+    {
+        "Site ID",
+        "Site_ID",
+        "site_id",
+        "tree_id",
+        "tree_row_id",
+        "qs_id",
+        "quarter_section",
+        "QTRSEC",
+        "english_translation",
+        "English_Translation",
+    }
+)
 
 
 def _shap_explanation_sql(cfg: BigQueryEnvConfig) -> str:
@@ -781,11 +905,40 @@ def _shap_explanation_sql(cfg: BigQueryEnvConfig) -> str:
     site_expr = _shap_site_id_sql_expr("s", site_col)
     t = _table_ref(shap_fqn)
     return f"""
-    SELECT CAST(s.english_translation AS STRING) AS english_translation
+    SELECT s.*
     FROM {t} AS s
     WHERE CAST({site_expr} AS STRING) = TRIM(@site_id)
     LIMIT 1
     """
+
+
+def _shap_numeric_contributions_from_row(row: Any) -> list[dict[str, Any]]:
+    """Top SHAP feature contributions from a BigQuery row (numeric fields only)."""
+    if row is None:
+        return []
+    items: list[tuple[str, float]] = []
+    try:
+        keys = list(row.keys())
+    except Exception:  # noqa: BLE001
+        return []
+    for key in keys:
+        col = str(key)
+        if col in _SHAP_CONTRIBUTION_SKIP_COLUMNS:
+            continue
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not (val == val):  # NaN
+            continue
+        if abs(val) < 1e-9:
+            continue
+        items.append((col, val))
+    items.sort(key=lambda x: abs(x[1]), reverse=True)
+    return [{"feature": name, "value": val} for name, val in items[:18]]
 
 
 def _log_shap_query_start(cfg: BigQueryEnvConfig, sql: str) -> None:
@@ -818,12 +971,15 @@ def _shap_explanation_payload_from_bigquery(
     job = _run_query(client, sql, location=cfg.location, job_config=job_config)
     rows = list(job.result())
     if not rows:
-        return {"english_translation": None}
-    raw = rows[0].get("english_translation")
-    if raw is None:
-        return {"english_translation": None}
-    text = str(raw).strip()
-    return {"english_translation": text if text else None}
+        return {"english_translation": None, "contributions": [], "site_id": site_id}
+    row = rows[0]
+    raw = row.get("english_translation")
+    text = str(raw).strip() if raw is not None else ""
+    return {
+        "site_id": site_id,
+        "english_translation": text if text else None,
+        "contributions": _shap_numeric_contributions_from_row(row),
+    }
 
 
 @https_fn.on_request()
@@ -838,19 +994,13 @@ def getQuarterSectionSummaries(req: https_fn.Request) -> https_fn.Response:
     if req.method != "GET":
         return _json_response(req, {"error": "Method not allowed"}, status=405)
 
-    if _verify_firebase_user(req) is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
 
     bq_cfg = bigquery_config_from_environ()
     http_key = cached_http.cache_key_from_request(req)
-    full_key = f"summaries|{http_key}|{_bq_config_cache_fingerprint(bq_cfg)}"
+    full_key = f"summaries|{_SUMMARIES_PAYLOAD_CACHE_REVISION}|{http_key}|{_bq_config_cache_fingerprint(bq_cfg)}"
     cc = cached_http.cache_control_header(_SUMMARIES_TTL_SECONDS)
     try:
 
@@ -897,15 +1047,9 @@ def getTreesByQs(req: https_fn.Request) -> https_fn.Response:
     if req.method != "GET":
         return _json_response(req, {"error": "Method not allowed"}, status=405)
 
-    if _verify_firebase_user(req) is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
 
     qs_id = _parse_query_param(req, "qs_id")
     if not qs_id or not str(qs_id).strip():
@@ -949,22 +1093,16 @@ def getTreesByQs(req: https_fn.Request) -> https_fn.Response:
 
 @https_fn.on_request()
 def getTreeShapExplanation(req: https_fn.Request) -> https_fn.Response:
-    """BigQuery: SHAP English explanation for one tree/site. GET ?site_id=... (only ``english_translation`` scanned)."""
+    """BigQuery: SHAP narrative + numeric feature contributions for one tree/site. GET ?site_id=..."""
     if req.method == "OPTIONS":
         return _cors_preflight_response(req)
 
     if req.method != "GET":
         return _json_response(req, {"error": "Method not allowed"}, status=405)
 
-    if _verify_firebase_user(req) is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
 
     site_id = _parse_query_param(req, "site_id")
     if not (site_id and str(site_id).strip()):
@@ -1007,6 +1145,992 @@ def getTreeShapExplanation(req: https_fn.Request) -> https_fn.Response:
             req,
             {
                 "error": "Failed to load SHAP explanation",
+                "detail": str(e),
+                "error_type": type(e).__name__,
+            },
+            status=500,
+        )
+
+
+_PRIORITY_HISTORY_TTL_SECONDS = 300
+_PRIORITY_HISTORY_CACHE_REVISION = "v11"
+_DEFAULT_BASELINE_AT = "2026-01-01T00:00:00Z"
+SCORE_METRIC_AVG_TREE_PS = "avg_tree_priority_score"
+
+
+def _history_table_fqn(cfg: BigQueryEnvConfig, table_name: str) -> str:
+    safe = _safe_dataset_or_table_id(table_name, table_name)
+    return f"{cfg.project_id}.{cfg.dataset}.{safe}"
+
+
+def _parse_optional_date_param(raw: str | None) -> str | None:
+    """Return YYYY-MM-DD if valid, else None."""
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()[:10]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    return None
+
+
+def _sync_runs_history_sql(cfg: BigQueryEnvConfig) -> str:
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    return f"""
+    SELECT
+      CAST(sync_run_id AS STRING) AS sync_run_id,
+      CAST(started_at AS STRING) AS started_at,
+      CAST(completed_at AS STRING) AS completed_at,
+      CAST(status AS STRING) AS status,
+      CAST(trees_changed AS INT64) AS trees_changed,
+      CAST(trees_ps_recomputed AS INT64) AS trees_ps_recomputed,
+      CAST(qs_updated AS INT64) AS qs_updated,
+      CAST(model_version AS STRING) AS model_version
+    FROM {runs_t}
+    WHERE CAST(status AS STRING) = 'success'
+    ORDER BY completed_at ASC
+    """
+
+
+def _count_successful_syncs(cfg: BigQueryEnvConfig, client: bigquery.Client) -> int:
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    sql = f"SELECT COUNT(*) AS n FROM {runs_t} WHERE CAST(status AS STRING) = 'success'"
+    rows = list(_run_query(client, sql, location=cfg.location).result())
+    if not rows:
+        return 0
+    return int(rows[0].get("n") or 0)
+
+
+def _history_row_success_only_clause() -> str:
+    return "CAST(r.status AS STRING) = 'success'"
+
+
+def _operational_tree_tables(cfg: BigQueryEnvConfig) -> tuple[str, str, str, str]:
+    core_t = _table_ref(cfg.trees_table_fqn)
+    tf_t = _table_ref(f"{cfg.project_id}.{cfg.dataset}.trees_features")
+    qs_t = _table_ref(cfg.qs_table_fqn)
+    id_col = cfg.qs_join_column
+    return core_t, tf_t, qs_t, id_col
+
+
+def _priority_history_qs_sql(cfg: BigQueryEnvConfig) -> str:
+    """Multi-sync QS epochs: district-wide averages reconstructed across all trees per sync."""
+    return _priority_history_entity_epochs_sql(cfg, entity="quarter_section")
+
+
+def _priority_history_district_sql(cfg: BigQueryEnvConfig) -> str:
+    """Multi-sync district epochs: averages reconstructed across all trees per sync."""
+    return _priority_history_entity_epochs_sql(cfg, entity="district")
+
+
+def _priority_history_entity_epochs_sql(cfg: BigQueryEnvConfig, *, entity: str) -> str:
+    """
+    Reconstruct post-sync priority_score at each successful sync using all operational trees.
+
+    trees_snapshot_history only has changed trees; naive AVG per sync_run_id compares
+    incomparable subsets. Per tree: post-sync after sync i is the next sync's pre-sync PS,
+    or current operational PS when no later change exists (latest sync always operational).
+  """
+    tree_hist_t = _table_ref(_history_table_fqn(cfg, "trees_snapshot_history"))
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    core_t, tf_t, qs_t, id_col = _operational_tree_tables(cfg)
+    is_qs = entity == "quarter_section"
+    group_select = (
+        "t.qs_id,\n      t.district,"
+        if is_qs
+        else "t.district,"
+    )
+    group_by_entity = "qs_id, district" if is_qs else "district"
+    order_entity = "qs_id" if is_qs else "district"
+    qs_filters = (
+        """
+        AND TRIM(CAST(c.qs_id AS STRING)) != ''
+        AND (@qs_id IS NULL OR TRIM(CAST(c.qs_id AS STRING)) = @qs_id)
+        """
+        if is_qs
+        else ""
+    )
+    return f"""
+    WITH sync_order AS (
+      SELECT
+        CAST(sync_run_id AS STRING) AS sync_run_id,
+        CAST(completed_at AS STRING) AS completed_at,
+        ROW_NUMBER() OVER (ORDER BY completed_at ASC) AS sync_idx
+      FROM {runs_t}
+      WHERE CAST(status AS STRING) = 'success'
+    ),
+    max_sync AS (
+      SELECT MAX(sync_idx) AS max_idx FROM sync_order
+    ),
+    all_trees AS (
+      SELECT
+        TRIM(CAST(c.tree_id AS STRING)) AS tree_id,
+        TRIM(CAST(c.qs_id AS STRING)) AS qs_id,
+        CAST(COALESCE(qs.district, 'Unknown') AS STRING) AS district,
+        SAFE_CAST(f.priority_score AS FLOAT64) AS current_ps
+      FROM {core_t} AS c
+      INNER JOIN {tf_t} AS f
+        ON TRIM(CAST(c.tree_id AS STRING)) = TRIM(CAST(f.tree_id AS STRING))
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(c.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE c.qs_id IS NOT NULL
+        AND f.priority_score IS NOT NULL
+        {qs_filters}
+        AND (@district IS NULL OR CAST(COALESCE(qs.district, 'Unknown') AS STRING) = @district)
+        AND CAST(COALESCE(qs.district, 'Unknown') AS STRING) != 'Unknown'
+    ),
+    history AS (
+      SELECT
+        TRIM(CAST(h.tree_id AS STRING)) AS tree_id,
+        so.sync_idx,
+        SAFE_CAST(h.priority_score AS FLOAT64) AS pre_sync_ps
+      FROM {tree_hist_t} AS h
+      INNER JOIN sync_order AS so
+        ON CAST(h.sync_run_id AS STRING) = so.sync_run_id
+      WHERE h.priority_score IS NOT NULL
+    ),
+    tree_post_epochs AS (
+      SELECT
+        t.tree_id,
+        t.qs_id,
+        t.district,
+        so.sync_idx,
+        so.sync_run_id,
+        so.completed_at AS recorded_at,
+        CASE
+          WHEN so.sync_idx = ms.max_idx THEN t.current_ps
+          ELSE COALESCE(hnext.pre_sync_ps, t.current_ps)
+        END AS epoch_ps
+      FROM all_trees AS t
+      CROSS JOIN sync_order AS so
+      CROSS JOIN max_sync AS ms
+      LEFT JOIN history AS hnext
+        ON hnext.tree_id = t.tree_id
+        AND hnext.sync_idx = so.sync_idx + 1
+    ),
+    baseline_trees AS (
+      SELECT
+        t.tree_id,
+        t.qs_id,
+        t.district,
+        COALESCE(h1.pre_sync_ps, t.current_ps) AS baseline_ps
+      FROM all_trees AS t
+      LEFT JOIN history AS h1
+        ON h1.tree_id = t.tree_id
+        AND h1.sync_idx = 1
+    ),
+    post_epochs AS (
+      SELECT
+        {group_select}
+        sync_run_id,
+        recorded_at,
+        FALSE AS is_baseline_load,
+        FALSE AS is_synthetic_baseline,
+        'sync' AS phase,
+        AVG(epoch_ps) AS priority_score,
+        COUNT(*) AS n
+        {", COUNT(DISTINCT t.qs_id) AS qs_count" if not is_qs else ""}
+      FROM tree_post_epochs AS t
+      GROUP BY {group_by_entity}, sync_idx, sync_run_id, recorded_at
+    ),
+    baseline_epoch AS (
+      SELECT
+        {group_select}
+        'initial-load' AS sync_run_id,
+        CAST(@baseline_at AS STRING) AS recorded_at,
+        TRUE AS is_baseline_load,
+        TRUE AS is_synthetic_baseline,
+        'baseline' AS phase,
+        AVG(baseline_ps) AS priority_score,
+        COUNT(*) AS n
+        {", COUNT(DISTINCT t.qs_id) AS qs_count" if not is_qs else ""}
+      FROM baseline_trees AS t
+      GROUP BY {group_by_entity}
+    )
+    SELECT * FROM baseline_epoch
+    WHERE (@from_date IS NULL OR DATE(recorded_at) >= @from_date)
+      AND (@to_date IS NULL OR DATE(recorded_at) <= @to_date)
+    UNION ALL
+    SELECT * FROM post_epochs
+    WHERE (@from_date IS NULL OR DATE(recorded_at) >= @from_date)
+      AND (@to_date IS NULL OR DATE(recorded_at) <= @to_date)
+    ORDER BY recorded_at ASC, {order_entity} ASC
+    """
+
+
+def _priority_history_movers_from_rows(
+    rows: list[dict[str, Any]], *, id_key: str = "qs_id"
+) -> list[dict[str, Any]]:
+    """Rank entities by absolute score change between earliest and latest sync point."""
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        entity_id = str(row.get(id_key) or "").strip()
+        if not entity_id:
+            continue
+        by_id.setdefault(entity_id, []).append(row)
+    movers: list[dict[str, Any]] = []
+    for entity_id, points in by_id.items():
+        if len(points) < 2:
+            continue
+        sorted_pts = sorted(points, key=lambda p: str(p.get("recorded_at") or ""))
+        prev = sorted_pts[-2]
+        latest = sorted_pts[-1]
+        prev_score = _optional_float_for_json(prev.get("priority_score"))
+        latest_score = _optional_float_for_json(latest.get("priority_score"))
+        if prev_score is None or latest_score is None:
+            continue
+        delta = latest_score - prev_score
+        movers.append(
+            {
+                "id": entity_id,
+                "district": str(latest.get("district") or prev.get("district") or "Unknown"),
+                "prev_score": prev_score,
+                "latest_score": latest_score,
+                "delta": delta,
+                "recorded_at": latest.get("recorded_at"),
+                "prev_recorded_at": prev.get("recorded_at"),
+            }
+        )
+    movers.sort(key=lambda m: abs(float(m.get("delta") or 0.0)), reverse=True)
+    return movers[:25]
+
+
+def _series_from_history_rows(
+    rows: list[dict[str, Any]], *, id_key: str, label_prefix: str = ""
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entity_id = str(row.get(id_key) or "").strip()
+        if not entity_id:
+            continue
+        bucket = grouped.setdefault(
+            entity_id,
+            {
+                "id": entity_id,
+                "label": f"{label_prefix}{entity_id}" if label_prefix else entity_id,
+                "district": str(row.get("district") or "Unknown"),
+                "points": [],
+            },
+        )
+        if row.get("district"):
+            bucket["district"] = str(row.get("district"))
+        point: dict[str, Any] = {
+            "recorded_at": row.get("recorded_at"),
+            "sync_run_id": row.get("sync_run_id"),
+            "priority_score": _optional_float_for_json(row.get("priority_score")),
+        }
+        if row.get("is_baseline_load") in (True, "true", "True", 1):
+            point["is_baseline_load"] = True
+        if row.get("is_synthetic_baseline") in (True, "true", "True", 1):
+            point["is_synthetic_baseline"] = True
+        if row.get("phase"):
+            point["phase"] = str(row.get("phase"))
+        if row.get("n") is not None:
+            point["n"] = int(row.get("n") or 0)
+        if row.get("ps_composite") is not None:
+            point["ps_composite"] = _optional_float_for_json(row.get("ps_composite"))
+        if row.get("qs_count") is not None:
+            point["qs_count"] = int(row.get("qs_count") or 0)
+        bucket["points"].append(point)
+    series = list(grouped.values())
+    series.sort(key=lambda s: str(s.get("id") or ""))
+    return series
+
+
+def _ensure_baseline_sync_run(sync_rows: list[dict[str, Any]], baseline_at: str | None) -> list[dict[str, Any]]:
+    """If the initial bulk load has history rows but no sync_runs entry, synthesize one for the UI."""
+    if not baseline_at:
+        return sync_rows
+    baseline_day = baseline_at[:10]
+    for row in sync_rows:
+        completed = str(row.get("completed_at") or row.get("started_at") or "")
+        if completed[:10] == baseline_day:
+            return sync_rows
+        source = str(row.get("source") or "").strip().lower()
+        run_id = str(row.get("sync_run_id") or "").strip().lower()
+        if source in ("baseline", "initial", "initial_load", "legacy") or run_id in (
+            "initial-load",
+            "initial_load",
+        ):
+            return sync_rows
+    out = list(sync_rows)
+    out.insert(
+        0,
+        {
+            "sync_run_id": "initial-load",
+            "started_at": baseline_at,
+            "completed_at": baseline_at,
+            "status": "success",
+            "source": "baseline",
+            "trees_changed": None,
+            "trees_ps_recomputed": None,
+            "qs_updated": None,
+            "model_version": None,
+        },
+    )
+    return out
+
+
+def _two_point_qs_history_sql(cfg: BigQueryEnvConfig) -> str:
+    """
+    First-sync two-point QS series: average tree priority_score (0–1).
+
+    Baseline: pre-sync tree PS from trees_snapshot_history (changed trees per QS).
+    Post-sync: average tree PS from live trees_core + trees_features.
+    """
+    tree_hist_t = _table_ref(_history_table_fqn(cfg, "trees_snapshot_history"))
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    core_t, tf_t, qs_t, id_col = _operational_tree_tables(cfg)
+    return f"""
+    WITH first_sync AS (
+      SELECT
+        CAST(sync_run_id AS STRING) AS sync_run_id,
+        CAST(completed_at AS STRING) AS completed_at
+      FROM {runs_t}
+      WHERE CAST(status AS STRING) = 'success'
+      ORDER BY completed_at ASC
+      LIMIT 1
+    ),
+    operational AS (
+      SELECT
+        TRIM(CAST(c.qs_id AS STRING)) AS qs_id,
+        CAST(COALESCE(qs.district, 'Unknown') AS STRING) AS district,
+        AVG(SAFE_CAST(f.priority_score AS FLOAT64)) AS priority_score,
+        COUNT(*) AS n
+      FROM {core_t} AS c
+      INNER JOIN {tf_t} AS f
+        ON TRIM(CAST(c.tree_id AS STRING)) = TRIM(CAST(f.tree_id AS STRING))
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(c.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE c.qs_id IS NOT NULL
+        AND TRIM(CAST(c.qs_id AS STRING)) != ''
+        AND f.priority_score IS NOT NULL
+        AND (@qs_id IS NULL OR TRIM(CAST(c.qs_id AS STRING)) = @qs_id)
+        AND (@district IS NULL OR CAST(COALESCE(qs.district, 'Unknown') AS STRING) = @district)
+      GROUP BY qs_id, district
+    ),
+    tree_baseline AS (
+      SELECT
+        TRIM(CAST(h.qs_id AS STRING)) AS qs_id,
+        AVG(SAFE_CAST(h.priority_score AS FLOAT64)) AS priority_score,
+        COUNT(*) AS tree_count
+      FROM {tree_hist_t} AS h
+      CROSS JOIN first_sync AS fs
+      WHERE CAST(h.sync_run_id AS STRING) = fs.sync_run_id
+        AND h.qs_id IS NOT NULL
+        AND TRIM(CAST(h.qs_id AS STRING)) != ''
+        AND h.priority_score IS NOT NULL
+      GROUP BY qs_id
+    )
+    SELECT
+      o.qs_id,
+      o.district,
+      'initial-load' AS sync_run_id,
+      CAST(@baseline_at AS STRING) AS recorded_at,
+      COALESCE(tb.priority_score, o.priority_score) AS priority_score,
+      COALESCE(tb.tree_count, o.n) AS n,
+      TRUE AS is_baseline_load,
+      (tb.qs_id IS NOT NULL) AS is_synthetic_baseline,
+      'baseline' AS phase
+    FROM operational AS o
+    LEFT JOIN tree_baseline AS tb
+      ON o.qs_id = tb.qs_id
+
+    UNION ALL
+
+    SELECT
+      o.qs_id,
+      o.district,
+      fs.sync_run_id,
+      fs.completed_at AS recorded_at,
+      o.priority_score,
+      o.n,
+      FALSE AS is_baseline_load,
+      FALSE AS is_synthetic_baseline,
+      'post_sync' AS phase
+    FROM operational AS o
+    CROSS JOIN first_sync AS fs
+    ORDER BY recorded_at ASC, qs_id ASC
+    """
+
+
+def _two_point_district_history_sql(cfg: BigQueryEnvConfig) -> str:
+    """District average tree priority_score for the first-sync two-point pattern."""
+    tree_hist_t = _table_ref(_history_table_fqn(cfg, "trees_snapshot_history"))
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    core_t, tf_t, qs_t, id_col = _operational_tree_tables(cfg)
+    return f"""
+    WITH first_sync AS (
+      SELECT
+        CAST(sync_run_id AS STRING) AS sync_run_id,
+        CAST(completed_at AS STRING) AS completed_at
+      FROM {runs_t}
+      WHERE CAST(status AS STRING) = 'success'
+      ORDER BY completed_at ASC
+      LIMIT 1
+    ),
+    operational AS (
+      SELECT
+        CAST(COALESCE(qs.district, 'Unknown') AS STRING) AS district,
+        AVG(SAFE_CAST(f.priority_score AS FLOAT64)) AS priority_score,
+        COUNT(*) AS n,
+        COUNT(DISTINCT TRIM(CAST(c.qs_id AS STRING))) AS qs_count
+      FROM {core_t} AS c
+      INNER JOIN {tf_t} AS f
+        ON TRIM(CAST(c.tree_id AS STRING)) = TRIM(CAST(f.tree_id AS STRING))
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(c.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE c.qs_id IS NOT NULL
+        AND f.priority_score IS NOT NULL
+        AND (@district IS NULL OR CAST(COALESCE(qs.district, 'Unknown') AS STRING) = @district)
+        AND CAST(COALESCE(qs.district, 'Unknown') AS STRING) != 'Unknown'
+      GROUP BY district
+    ),
+    tree_baseline AS (
+      SELECT
+        CAST(COALESCE(qs.district, CAST(h.district AS STRING), 'Unknown') AS STRING) AS district,
+        AVG(SAFE_CAST(h.priority_score AS FLOAT64)) AS priority_score,
+        COUNT(*) AS n,
+        COUNT(DISTINCT TRIM(CAST(h.qs_id AS STRING))) AS qs_count
+      FROM {tree_hist_t} AS h
+      CROSS JOIN first_sync AS fs
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(h.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE CAST(h.sync_run_id AS STRING) = fs.sync_run_id
+        AND h.priority_score IS NOT NULL
+        AND CAST(COALESCE(qs.district, CAST(h.district AS STRING), 'Unknown') AS STRING) != 'Unknown'
+      GROUP BY district
+    )
+    SELECT
+      o.district,
+      'initial-load' AS sync_run_id,
+      CAST(@baseline_at AS STRING) AS recorded_at,
+      COALESCE(tb.priority_score, o.priority_score) AS priority_score,
+      COALESCE(tb.n, o.n) AS n,
+      COALESCE(tb.qs_count, o.qs_count) AS qs_count,
+      TRUE AS is_baseline_load,
+      (tb.district IS NOT NULL) AS is_synthetic_baseline,
+      'baseline' AS phase
+    FROM operational AS o
+    LEFT JOIN tree_baseline AS tb
+      ON o.district = tb.district
+
+    UNION ALL
+
+    SELECT
+      o.district,
+      fs.sync_run_id,
+      fs.completed_at AS recorded_at,
+      o.priority_score,
+      o.n,
+      o.qs_count,
+      FALSE AS is_baseline_load,
+      FALSE AS is_synthetic_baseline,
+      'post_sync' AS phase
+    FROM operational AS o
+    CROSS JOIN first_sync AS fs
+    ORDER BY recorded_at ASC, district ASC
+    """
+
+
+def _resolve_synthetic_baseline_at(
+    cfg: BigQueryEnvConfig,
+    *,
+    sync_rows: list[dict[str, Any]],
+) -> str:
+    """Synthetic x-axis date for the pre-sync inventory point (not stored in BQ)."""
+    override = _env("BQ_BASELINE_LOAD_AT")
+    if override:
+        return override
+    if sync_rows:
+        success_times = [
+            str(r.get("completed_at") or r.get("started_at") or "").strip()
+            for r in sync_rows
+            if str(r.get("completed_at") or r.get("started_at") or "").strip()
+        ]
+        if success_times:
+            first_success_at = min(success_times)
+            try:
+                normalized = first_success_at.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                approx = dt - timedelta(days=150)
+                return approx.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                pass
+    return _DEFAULT_BASELINE_AT
+
+
+def _is_unknown_district(name: str | None) -> bool:
+    return str(name or "").strip().lower() in ("", "unknown")
+
+
+def _metric_epoch_row_to_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pivot epoch rows (wide metrics) into chart-friendly metric series."""
+    specs = [
+        ("avg_dbh", "Average DBH (in)", 1),
+        ("avg_height", "Average height (ft)", 1),
+        ("avg_condition", "Average condition (0–4)", 1),
+        ("tree_count", "Tree count", 0),
+        ("species_richness", "Distinct species", 0),
+    ]
+    out: list[dict[str, Any]] = []
+    for metric_id, label, decimals in specs:
+        points: list[dict[str, Any]] = []
+        for row in rows:
+            raw = row.get(metric_id)
+            value = _optional_float_for_json(raw) if metric_id != "tree_count" else (
+                int(raw) if raw is not None and str(raw).strip() != "" else None
+            )
+            if metric_id == "tree_count" and value is None and raw is not None:
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    value = None
+            if value is None:
+                continue
+            pt: dict[str, Any] = {
+                "recorded_at": row.get("recorded_at"),
+                "value": float(value) if metric_id != "tree_count" else value,
+                "sync_run_id": row.get("sync_run_id"),
+            }
+            if row.get("phase"):
+                pt["phase"] = row.get("phase")
+            if row.get("is_baseline_load") in (True, "true", "True", 1):
+                pt["is_baseline_load"] = True
+            points.append(pt)
+        if points:
+            out.append(
+                {
+                    "id": metric_id,
+                    "label": label,
+                    "decimals": decimals,
+                    "points": points,
+                }
+            )
+    return out
+
+
+def _two_point_metric_epochs_sql(cfg: BigQueryEnvConfig) -> str:
+    """Two epoch rows (baseline + post) of inventory averages for the filtered tree set."""
+    tree_hist_t = _table_ref(_history_table_fqn(cfg, "trees_snapshot_history"))
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    core_t, tf_t, qs_t, id_col = _operational_tree_tables(cfg)
+    return f"""
+    WITH first_sync AS (
+      SELECT
+        CAST(sync_run_id AS STRING) AS sync_run_id,
+        CAST(completed_at AS STRING) AS completed_at
+      FROM {runs_t}
+      WHERE CAST(status AS STRING) = 'success'
+      ORDER BY completed_at ASC
+      LIMIT 1
+    ),
+    baseline AS (
+      SELECT
+        CAST(@baseline_at AS STRING) AS recorded_at,
+        'initial-load' AS sync_run_id,
+        'baseline' AS phase,
+        TRUE AS is_baseline_load,
+        AVG(SAFE_CAST(h.dbh AS FLOAT64)) AS avg_dbh,
+        AVG(SAFE_CAST(h.height AS FLOAT64)) AS avg_height,
+        AVG(SAFE_CAST(h.condition AS FLOAT64)) AS avg_condition,
+        COUNT(*) AS tree_count,
+        COUNT(DISTINCT h.species_id) AS species_richness
+      FROM {tree_hist_t} AS h
+      CROSS JOIN first_sync AS fs
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(h.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE CAST(h.sync_run_id AS STRING) = fs.sync_run_id
+        AND (@qs_id IS NULL OR TRIM(CAST(h.qs_id AS STRING)) = @qs_id)
+        AND (
+          @district IS NULL
+          OR CAST(COALESCE(qs.district, CAST(h.district AS STRING), 'Unknown') AS STRING) = @district
+        )
+        AND CAST(COALESCE(qs.district, CAST(h.district AS STRING), 'Unknown') AS STRING) != 'Unknown'
+    ),
+    post AS (
+      SELECT
+        fs.completed_at AS recorded_at,
+        fs.sync_run_id,
+        'post_sync' AS phase,
+        FALSE AS is_baseline_load,
+        AVG(SAFE_CAST(c.dbh AS FLOAT64)) AS avg_dbh,
+        AVG(SAFE_CAST(c.height AS FLOAT64)) AS avg_height,
+        AVG(SAFE_CAST(c.condition AS FLOAT64)) AS avg_condition,
+        COUNT(*) AS tree_count,
+        COUNT(DISTINCT c.species_id) AS species_richness
+      FROM {core_t} AS c
+      CROSS JOIN first_sync AS fs
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(c.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE c.qs_id IS NOT NULL
+        AND (@qs_id IS NULL OR TRIM(CAST(c.qs_id AS STRING)) = @qs_id)
+        AND (
+          @district IS NULL
+          OR CAST(COALESCE(qs.district, 'Unknown') AS STRING) = @district
+        )
+        AND CAST(COALESCE(qs.district, 'Unknown') AS STRING) != 'Unknown'
+      GROUP BY fs.completed_at, fs.sync_run_id
+    )
+    SELECT * FROM baseline
+    UNION ALL
+    SELECT * FROM post
+    ORDER BY recorded_at ASC
+    """
+
+
+def _multi_sync_metric_epochs_sql(cfg: BigQueryEnvConfig) -> str:
+    """Inventory metric epochs across all trees (not snapshot-only subsets)."""
+    tree_hist_t = _table_ref(_history_table_fqn(cfg, "trees_snapshot_history"))
+    runs_t = _table_ref(_history_table_fqn(cfg, "sync_runs"))
+    core_t, tf_t, qs_t, id_col = _operational_tree_tables(cfg)
+    return f"""
+    WITH sync_order AS (
+      SELECT
+        CAST(sync_run_id AS STRING) AS sync_run_id,
+        CAST(completed_at AS STRING) AS completed_at,
+        ROW_NUMBER() OVER (ORDER BY completed_at ASC) AS sync_idx
+      FROM {runs_t}
+      WHERE CAST(status AS STRING) = 'success'
+    ),
+    max_sync AS (
+      SELECT MAX(sync_idx) AS max_idx FROM sync_order
+    ),
+    all_trees AS (
+      SELECT
+        TRIM(CAST(c.tree_id AS STRING)) AS tree_id,
+        SAFE_CAST(c.dbh AS FLOAT64) AS current_dbh,
+        SAFE_CAST(c.height AS FLOAT64) AS current_height,
+        SAFE_CAST(c.condition AS FLOAT64) AS current_condition,
+        c.species_id AS current_species_id
+      FROM {core_t} AS c
+      LEFT JOIN {qs_t} AS qs
+        ON TRIM(CAST(c.qs_id AS STRING)) = TRIM(CAST(qs.{id_col} AS STRING))
+      WHERE c.qs_id IS NOT NULL
+        AND (@qs_id IS NULL OR TRIM(CAST(c.qs_id AS STRING)) = @qs_id)
+        AND (
+          @district IS NULL
+          OR CAST(COALESCE(qs.district, 'Unknown') AS STRING) = @district
+        )
+        AND CAST(COALESCE(qs.district, 'Unknown') AS STRING) != 'Unknown'
+    ),
+    history AS (
+      SELECT
+        TRIM(CAST(h.tree_id AS STRING)) AS tree_id,
+        so.sync_idx,
+        SAFE_CAST(h.dbh AS FLOAT64) AS pre_dbh,
+        SAFE_CAST(h.height AS FLOAT64) AS pre_height,
+        SAFE_CAST(h.condition AS FLOAT64) AS pre_condition,
+        h.species_id AS pre_species_id
+      FROM {tree_hist_t} AS h
+      INNER JOIN sync_order AS so
+        ON CAST(h.sync_run_id AS STRING) = so.sync_run_id
+    ),
+    tree_post_epochs AS (
+      SELECT
+        so.sync_idx,
+        so.sync_run_id,
+        so.completed_at AS recorded_at,
+        CASE WHEN so.sync_idx = ms.max_idx THEN t.current_dbh ELSE COALESCE(hnext.pre_dbh, t.current_dbh) END AS dbh,
+        CASE WHEN so.sync_idx = ms.max_idx THEN t.current_height ELSE COALESCE(hnext.pre_height, t.current_height) END AS height,
+        CASE WHEN so.sync_idx = ms.max_idx THEN t.current_condition ELSE COALESCE(hnext.pre_condition, t.current_condition) END AS condition,
+        CASE WHEN so.sync_idx = ms.max_idx THEN t.current_species_id ELSE COALESCE(hnext.pre_species_id, t.current_species_id) END AS species_id
+      FROM all_trees AS t
+      CROSS JOIN sync_order AS so
+      CROSS JOIN max_sync AS ms
+      LEFT JOIN history AS hnext
+        ON hnext.tree_id = t.tree_id
+        AND hnext.sync_idx = so.sync_idx + 1
+    ),
+    baseline_trees AS (
+      SELECT
+        COALESCE(h1.pre_dbh, t.current_dbh) AS dbh,
+        COALESCE(h1.pre_height, t.current_height) AS height,
+        COALESCE(h1.pre_condition, t.current_condition) AS condition,
+        COALESCE(h1.pre_species_id, t.current_species_id) AS species_id
+      FROM all_trees AS t
+      LEFT JOIN history AS h1
+        ON h1.tree_id = t.tree_id
+        AND h1.sync_idx = 1
+    ),
+    post_epochs AS (
+      SELECT
+        recorded_at,
+        sync_run_id,
+        'sync' AS phase,
+        FALSE AS is_baseline_load,
+        AVG(dbh) AS avg_dbh,
+        AVG(height) AS avg_height,
+        AVG(condition) AS avg_condition,
+        COUNT(*) AS tree_count,
+        COUNT(DISTINCT species_id) AS species_richness
+      FROM tree_post_epochs
+      GROUP BY sync_idx, sync_run_id, recorded_at
+    ),
+    baseline_epoch AS (
+      SELECT
+        CAST(@baseline_at AS STRING) AS recorded_at,
+        'initial-load' AS sync_run_id,
+        'baseline' AS phase,
+        TRUE AS is_baseline_load,
+        AVG(dbh) AS avg_dbh,
+        AVG(height) AS avg_height,
+        AVG(condition) AS avg_condition,
+        COUNT(*) AS tree_count,
+        COUNT(DISTINCT species_id) AS species_richness
+      FROM baseline_trees
+    )
+    SELECT * FROM baseline_epoch
+    WHERE (@from_date IS NULL OR DATE(recorded_at) >= @from_date)
+      AND (@to_date IS NULL OR DATE(recorded_at) <= @to_date)
+    UNION ALL
+    SELECT * FROM post_epochs
+    WHERE (@from_date IS NULL OR DATE(recorded_at) >= @from_date)
+      AND (@to_date IS NULL OR DATE(recorded_at) <= @to_date)
+    ORDER BY recorded_at ASC
+    """
+
+
+def _fetch_metric_trends(
+    cfg: BigQueryEnvConfig,
+    client: bigquery.Client,
+    *,
+    use_two_point: bool,
+    baseline_at: str | None,
+    qs_id: str | None,
+    district: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    params_base: list[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter],
+) -> list[dict[str, Any]]:
+    params = list(params_base)
+    if use_two_point:
+        if not baseline_at:
+            return []
+        if not any(getattr(p, "name", None) == "baseline_at" for p in params):
+            params.append(bigquery.ScalarQueryParameter("baseline_at", "STRING", baseline_at))
+        sql = _two_point_metric_epochs_sql(cfg)
+        label = "getPriorityHistory:metric_trends_two_point"
+    else:
+        sql = _multi_sync_metric_epochs_sql(cfg)
+        label = "getPriorityHistory:metric_trends_multi"
+
+    _log_bq_query_start(cfg, endpoint=label, sql=sql)
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    epoch_rows = [
+        dict(r.items())
+        for r in _run_query(client, sql, location=cfg.location, job_config=job_config).result()
+    ]
+    return _metric_epoch_row_to_trends(epoch_rows)
+
+
+def _filter_unknown_district_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in rows if not _is_unknown_district(str(r.get("district") or ""))]
+
+
+def _filter_unknown_district_series(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        s
+        for s in series
+        if not _is_unknown_district(str(s.get("id") or ""))
+        and not _is_unknown_district(str(s.get("district") or ""))
+    ]
+
+
+def _distinct_history_dates(rows: list[dict[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for row in rows:
+        raw = row.get("recorded_at")
+        if raw is None:
+            continue
+        out.add(str(raw)[:10])
+    return out
+
+
+def _priority_history_payload_from_bigquery(
+    cfg: BigQueryEnvConfig,
+    client: bigquery.Client,
+    *,
+    scope: str,
+    qs_id: str | None,
+    district: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> dict[str, Any]:
+    sync_sql = _sync_runs_history_sql(cfg)
+    _log_bq_query_start(cfg, endpoint="getPriorityHistory:sync_runs", sql=sync_sql)
+    sync_rows = [
+        dict(r.items())
+        for r in _run_query(client, sync_sql, location=cfg.location).result()
+    ]
+    successful_sync_count = _count_successful_syncs(cfg, client)
+    use_two_point = successful_sync_count < 2
+
+    scope_norm = (scope or "quarter_section").strip().lower()
+    if scope_norm not in ("quarter_section", "district"):
+        scope_norm = "quarter_section"
+
+    params: list[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter] = [
+        bigquery.ScalarQueryParameter("qs_id", "STRING", qs_id),
+        bigquery.ScalarQueryParameter("district", "STRING", district),
+    ]
+    if from_date:
+        params.append(bigquery.ScalarQueryParameter("from_date", "DATE", from_date))
+    else:
+        params.append(bigquery.ScalarQueryParameter("from_date", "DATE", None))
+    if to_date:
+        params.append(bigquery.ScalarQueryParameter("to_date", "DATE", to_date))
+    else:
+        params.append(bigquery.ScalarQueryParameter("to_date", "DATE", None))
+
+    synthetic_baseline_at: str | None = None
+    synthetic_injected = False
+
+    if use_two_point:
+        synthetic_baseline_at = _resolve_synthetic_baseline_at(cfg, sync_rows=sync_rows)
+        params.append(bigquery.ScalarQueryParameter("baseline_at", "STRING", synthetic_baseline_at))
+        if scope_norm == "district":
+            hist_sql = _two_point_district_history_sql(cfg)
+            id_key = "district"
+            label_prefix = "District "
+        else:
+            hist_sql = _two_point_qs_history_sql(cfg)
+            id_key = "qs_id"
+            label_prefix = "QS "
+        synthetic_injected = True
+        sync_rows = _ensure_baseline_sync_run(sync_rows, synthetic_baseline_at)
+    else:
+        synthetic_baseline_at = _resolve_synthetic_baseline_at(cfg, sync_rows=sync_rows)
+        params.append(bigquery.ScalarQueryParameter("baseline_at", "STRING", synthetic_baseline_at))
+        synthetic_injected = True
+        sync_rows = _ensure_baseline_sync_run(sync_rows, synthetic_baseline_at)
+        if scope_norm == "district":
+            hist_sql = _priority_history_district_sql(cfg)
+            id_key = "district"
+            label_prefix = "District "
+        else:
+            hist_sql = _priority_history_qs_sql(cfg)
+            id_key = "qs_id"
+            label_prefix = "QS "
+
+    _log_bq_query_start(
+        cfg,
+        endpoint=f"getPriorityHistory:{scope_norm}{':two_point' if use_two_point else ''}",
+        sql=hist_sql,
+    )
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    hist_rows = [
+        dict(r.items())
+        for r in _run_query(client, hist_sql, location=cfg.location, job_config=job_config).result()
+    ]
+    if scope_norm == "district":
+        hist_rows = _filter_unknown_district_rows(hist_rows)
+
+    series = _series_from_history_rows(hist_rows, id_key=id_key, label_prefix=label_prefix)
+    if scope_norm == "district":
+        series = _filter_unknown_district_series(series)
+    movers = _priority_history_movers_from_rows(hist_rows, id_key=id_key)
+
+    metric_trends: list[dict[str, Any]] = []
+    if scope_norm == "quarter_section":
+        metric_trends = _fetch_metric_trends(
+            cfg,
+            client,
+            use_two_point=use_two_point,
+            baseline_at=synthetic_baseline_at,
+            qs_id=qs_id,
+            district=district,
+            from_date=from_date,
+            to_date=to_date,
+            params_base=params,
+        )
+
+    districts = sorted(
+        {
+            str(r.get("district") or "")
+            for r in hist_rows
+            if r.get("district") and not _is_unknown_district(str(r.get("district")))
+        }
+    )
+
+    return {
+        "scope": scope_norm,
+        "score_metric": SCORE_METRIC_AVG_TREE_PS,
+        "sync_runs": sync_rows,
+        "series": series,
+        "movers": movers,
+        "metric_trends": metric_trends,
+        "districts": districts,
+        "synthetic_baseline_injected": synthetic_injected,
+        "synthetic_baseline_at": synthetic_baseline_at,
+        "two_point_mode": use_two_point,
+        "successful_sync_count": successful_sync_count,
+        "filters": {
+            "qs_id": qs_id,
+            "district": district,
+            "from": from_date,
+            "to": to_date,
+        },
+    }
+
+
+@https_fn.on_request()
+def getPriorityHistory(req: https_fn.Request) -> https_fn.Response:
+    """BigQuery: quarter-section or district priority score history from qs_priority_history."""
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+
+    if req.method != "GET":
+        return _json_response(req, {"error": "Method not allowed"}, status=405)
+
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
+
+    scope = str(_parse_query_param(req, "scope") or "quarter_section").strip().lower()
+    qs_id_raw = _parse_query_param(req, "qs_id")
+    qs_id = str(qs_id_raw).strip() if qs_id_raw and str(qs_id_raw).strip() else None
+    district_raw = _parse_query_param(req, "district")
+    district = str(district_raw).strip() if district_raw and str(district_raw).strip() else None
+    from_date = _parse_optional_date_param(_parse_query_param(req, "from"))
+    to_date = _parse_optional_date_param(_parse_query_param(req, "to"))
+
+    bq_cfg = bigquery_config_from_environ()
+    http_key = cached_http.cache_key_from_request(req)
+    full_key = (
+        f"priority_history|{_PRIORITY_HISTORY_CACHE_REVISION}|{http_key}|"
+        f"{_bq_config_cache_fingerprint(bq_cfg)}"
+    )
+    cc = cached_http.cache_control_header(_PRIORITY_HISTORY_TTL_SECONDS)
+    try:
+
+        def _produce() -> dict[str, Any]:
+            client = _bigquery_client(bq_cfg)
+            return _priority_history_payload_from_bigquery(
+                bq_cfg,
+                client,
+                scope=scope,
+                qs_id=qs_id,
+                district=district,
+                from_date=from_date,
+                to_date=to_date,
+            )
+
+        payload, _hit = cached_http.json_cache_fetch(
+            full_key,
+            _PRIORITY_HISTORY_TTL_SECONDS,
+            _produce,
+            log_label="getPriorityHistory",
+        )
+        return _json_response(req, payload, status=200, cache_control=cc)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("getPriorityHistory failed scope=%s qs_id=%s district=%s", scope, qs_id, district)
+        return _json_response(
+            req,
+            {
+                "error": "Failed to load priority score history",
+                "message": str(e),
                 "detail": str(e),
                 "error_type": type(e).__name__,
             },
@@ -1600,6 +2724,7 @@ def _analytics_source_sql(cfg: BigQueryEnvConfig) -> str:
     qsid = cfg.qs_join_column
     return f"""
     SELECT
+      TRIM(CAST(qsp.qs_id AS STRING)) AS qs_id,
       CAST(COALESCE(s.simple_species, s.common_name, s.full_name, s.scientific_name, 'Unknown') AS STRING) AS top_species,
       CAST(COALESCE(qs.district, 'Unknown') AS STRING) AS district,
       CAST(COALESCE(t.status, 'Unknown') AS STRING) AS tree_status,
@@ -1640,10 +2765,10 @@ def _analytics_source_sql(cfg: BigQueryEnvConfig) -> str:
       ON CAST(t.tree_id AS STRING) = CAST(tf.tree_id AS STRING)
     LEFT JOIN {species_t} s
       ON t.species_id = s.species_id
-    LEFT JOIN {qs_t} qs
-      ON TRIM(CAST(t.{tqs} AS STRING)) = TRIM(CAST(qs.{qsid} AS STRING))
-    LEFT JOIN {qsp_t} qsp
+    INNER JOIN {qsp_t} qsp
       ON TRIM(CAST(t.{tqs} AS STRING)) = TRIM(CAST(qsp.qs_id AS STRING))
+    LEFT JOIN {qs_t} qs
+      ON TRIM(CAST(qsp.qs_id AS STRING)) = TRIM(CAST(qs.{qsid} AS STRING))
     """
 
 
@@ -1653,15 +2778,9 @@ def analytics_query(req: https_fn.Request) -> https_fn.Response:
         return _cors_preflight_response(req)
     if req.method != "POST":
         return _json_response(req, {"error": "Method not allowed"}, status=405)
-    if _verify_firebase_user(req) is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
     body = req.get_json(silent=True) or {}
     draft = body.get("draft")
     if not isinstance(draft, dict):
@@ -1688,9 +2807,17 @@ def analytics_query(req: https_fn.Request) -> https_fn.Response:
             json.dumps({"table_fqn": table_fqn, "sql_preview": sql[:400], "params": param_specs}, default=str),
             flush=True,
         )
-        bq_params: list[bigquery.ScalarQueryParameter] = []
+        bq_params: list[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter] = []
         for p in param_specs:
-            bq_params.append(bigquery.ScalarQueryParameter(str(p["name"]), str(p["type"]), p.get("value")))
+            p_name = str(p["name"])
+            p_type = str(p["type"])
+            p_value = p.get("value")
+            if p_type == "ARRAY<STRING>":
+                bq_params.append(
+                    bigquery.ArrayQueryParameter(p_name, "STRING", list(p_value or [])),
+                )
+            else:
+                bq_params.append(bigquery.ScalarQueryParameter(p_name, p_type, p_value))
         client = _bigquery_client(cfg)
         job = _run_query(
             client,
@@ -1725,15 +2852,9 @@ def analytics_schema(req: https_fn.Request) -> https_fn.Response:
         return _cors_preflight_response(req)
     if req.method != "GET":
         return _json_response(req, {"error": "Method not allowed"}, status=405)
-    if _verify_firebase_user(req) is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    _, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
     try:
         from analytics_query.compiler import DIMENSION_TO_COLUMN, MEASURE_TO_COLUMN
 
@@ -1750,16 +2871,9 @@ def userTasksApi(req: https_fn.Request) -> https_fn.Response:
     """Self-contained user/task CRUD for `users`, `service_requests`, `service_request_assignees`."""
     if req.method == "OPTIONS":
         return _cors_preflight_response(req)
-    claims = _verify_firebase_user(req)
-    if claims is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    claims, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
     cfg = bigquery_config_from_environ()
     client = _bigquery_client(cfg)
     try:
@@ -1825,16 +2939,9 @@ def treesDataApi(req: https_fn.Request) -> https_fn.Response:
     """Authenticated CRUD for ``trees_core`` (read one tree, list species, create / update / delete)."""
     if req.method == "OPTIONS":
         return _cors_preflight_response(req)
-    claims = _verify_firebase_user(req)
-    if claims is None:
-        return _json_response(
-            req,
-            {
-                "error": "Unauthorized",
-                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
-            },
-            status=401,
-        )
+    claims, auth_err = _require_approved_claims(req)
+    if auth_err is not None:
+        return auth_err
     cfg = bigquery_config_from_environ()
     client = _bigquery_client(cfg)
     try:
@@ -1878,5 +2985,199 @@ def treesDataApi(req: https_fn.Request) -> https_fn.Response:
         return _json_response(
             req,
             {"error": "treesDataApi failed", "detail": str(e), "error_type": type(e).__name__},
+            status=500,
+        )
+
+
+@https_fn.on_request()
+def accessApi(req: https_fn.Request) -> https_fn.Response:
+    """Registration, approval workflow, and access profile (does not require prior approval)."""
+    if req.method == "OPTIONS":
+        return _cors_preflight_response(req)
+    claims = _verify_firebase_user(req)
+    if claims is None:
+        return _json_response(
+            req,
+            {
+                "error": "Unauthorized",
+                "message": "Valid Firebase ID token required (Authorization: Bearer <token>)",
+            },
+            status=401,
+        )
+    cfg = bigquery_config_from_environ()
+    client = _bigquery_client(cfg)
+    try:
+        if req.method == "GET":
+            mode = str(_parse_query_param(req, "mode") or "me").strip().lower()
+            uid = str(claims.get("uid") or "")
+            if mode == "pending":
+                try:
+                    ac._require_admin_actor(
+                        claims,
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                    )
+                except PermissionError as e:
+                    return _json_response(req, {"error": "Forbidden", "message": str(e)}, status=403)
+                return _json_response(
+                    req,
+                    ac.list_users_payload(
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                        approval_filter=ac.APPROVAL_PENDING,
+                    ),
+                    status=200,
+                )
+            if mode == "all":
+                try:
+                    ac._require_admin_actor(
+                        claims,
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                    )
+                except PermissionError as e:
+                    return _json_response(req, {"error": "Forbidden", "message": str(e)}, status=403)
+                return _json_response(
+                    req,
+                    ac.list_users_payload(
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                    ),
+                    status=200,
+                )
+            if mode == "usage_stats":
+                try:
+                    days_raw = _parse_query_param(req, "days") or "30"
+                    days = int(str(days_raw))
+                except ValueError:
+                    days = 30
+                try:
+                    ac._require_admin_actor(
+                        claims,
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                    )
+                except PermissionError as e:
+                    return _json_response(req, {"error": "Forbidden", "message": str(e)}, status=403)
+                return _json_response(
+                    req,
+                    ac.usage_stats_payload(
+                        claims,
+                        days=days,
+                        cfg=cfg,
+                        client=client,
+                        table_ref_fn=_table_ref,
+                        run_query_fn=_run_query,
+                    ),
+                    status=200,
+                )
+            row = ac.ensure_bootstrap_user_promoted(
+                claims,
+                cfg=cfg,
+                client=client,
+                table_ref_fn=_table_ref,
+                run_query_fn=_run_query,
+            )
+            bootstrap = ac.is_bootstrap_admin_email(str(claims.get("email") or ""))
+            return _json_response(
+                req,
+                {
+                    "profile": row,
+                    "approval_required": ac.access_require_approval_enabled(),
+                    "is_approved": ac.is_approved_for_claims(row, claims),
+                    "is_admin": ac.is_admin_for_claims(row, claims),
+                    "bootstrap_admin": bootstrap,
+                },
+                status=200,
+            )
+        if req.method != "POST":
+            return _json_response(req, {"error": "Method not allowed"}, status=405)
+        body = req.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip().lower()
+        if action == "register":
+            return _json_response(
+                req,
+                ac.register_access_request(
+                    body,
+                    claims,
+                    cfg=cfg,
+                    client=client,
+                    table_ref_fn=_table_ref,
+                    run_query_fn=_run_query,
+                ),
+                status=200,
+            )
+        if action == "approve":
+            return _json_response(
+                req,
+                ac.approve_user(
+                    body,
+                    claims,
+                    cfg=cfg,
+                    client=client,
+                    table_ref_fn=_table_ref,
+                    run_query_fn=_run_query,
+                ),
+                status=200,
+            )
+        if action == "reject":
+            return _json_response(
+                req,
+                ac.reject_user(
+                    body,
+                    claims,
+                    cfg=cfg,
+                    client=client,
+                    table_ref_fn=_table_ref,
+                    run_query_fn=_run_query,
+                ),
+                status=200,
+            )
+        if action == "update_user":
+            return _json_response(
+                req,
+                ac.update_user_access(
+                    body,
+                    claims,
+                    cfg=cfg,
+                    client=client,
+                    table_ref_fn=_table_ref,
+                    run_query_fn=_run_query,
+                ),
+                status=200,
+            )
+        if action == "log_usage":
+            return _json_response(
+                req,
+                ac.log_usage_events(
+                    body,
+                    claims,
+                    cfg=cfg,
+                    client=client,
+                    table_ref_fn=_table_ref,
+                    run_query_fn=_run_query,
+                ),
+                status=200,
+            )
+        return _json_response(req, {"error": "Bad request", "message": "Unknown action"}, status=400)
+    except PermissionError as e:
+        return _json_response(req, {"error": "Forbidden", "message": str(e)}, status=403)
+    except ValueError as e:
+        return _json_response(req, {"error": "Bad request", "message": str(e)}, status=400)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("accessApi failed")
+        return _json_response(
+            req,
+            {"error": "accessApi failed", "detail": str(e), "error_type": type(e).__name__},
             status=500,
         )
